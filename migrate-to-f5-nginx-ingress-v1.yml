@@ -540,451 +540,460 @@
 # master/minion (mergeable) or onto a single object (plain), generates a CORS
 # Policy when enabled and attaches it via nginx.org/policies. Emits a JSON
 # result line consumed by reports/summary.
-- name: "[Step 4] Generate Ingress / master+minion / Policy YAMLs"
-  ansible.builtin.shell: |
-    python3 - << 'PYEOF'
-    import json, re, os, yaml
+- name: "[Step 4] Write generator script to tmp/"
+  ansible.builtin.copy:
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_generate_unit.py"
+    mode: '0700'
+    content: |
+        import json, re, os, yaml
 
-    base_path = "{{ _mig_backup_path }}/{{ _mig_namespace }}"
-    tmp_path  = os.path.join(base_path, 'tmp')
-    gen_base  = os.path.join(base_path, 'generated')
-    namespace = "{{ _mig_namespace }}"
-    new_class = "{{ _mig_new_class }}"
-    test_mode = "{{ _mig_test_mode }}" == "True"
-    test_host = "{{ _mig_test_host }}"
-    cors_default = "{{ _mig_cors_default }}" == "True"
-    hsts_default = "{{ _mig_hsts_default }}" == "True"
-    unit_index = int("{{ unit_index }}")
+        base_path = "{{ _mig_backup_path }}/{{ _mig_namespace }}"
+        tmp_path  = os.path.join(base_path, 'tmp')
+        gen_base  = os.path.join(base_path, 'generated')
+        namespace = "{{ _mig_namespace }}"
+        new_class = "{{ _mig_new_class }}"
+        test_mode = "{{ _mig_test_mode }}" == "True"
+        test_host = "{{ _mig_test_host }}"
+        cors_default = "{{ _mig_cors_default }}" == "True"
+        hsts_default = "{{ _mig_hsts_default }}" == "True"
+        unit_index = int(os.environ["UNIT_INDEX"])
 
-    with open(os.path.join(tmp_path, '_units.json')) as f:
-        units = json.load(f)
-    unit = units[unit_index]
+        with open(os.path.join(tmp_path, '_units.json')) as f:
+            units = json.load(f)
+        unit = units[unit_index]
 
-    primary_host  = unit['primary_host']
-    unit_type     = unit['unit_type']
-    source_names  = unit['source_ingress_names']
-    tls_secret    = unit['tls_secret']
-    unit_hosts    = unit['hosts']
+        primary_host  = unit['primary_host']
+        unit_type     = unit['unit_type']
+        source_names  = unit['source_ingress_names']
+        tls_secret    = unit['tls_secret']
+        unit_hosts    = unit['hosts']
 
-    sanitized = re.sub(r'[^a-zA-Z0-9]', '-', primary_host).strip('-').lower()
-    gen_path  = os.path.join(gen_base, sanitized)
-    os.makedirs(gen_path, exist_ok=True)
+        sanitized = re.sub(r'[^a-zA-Z0-9]', '-', primary_host).strip('-').lower()
+        gen_path  = os.path.join(gen_base, sanitized)
+        os.makedirs(gen_path, exist_ok=True)
 
-    P = "nginx.ingress.kubernetes.io/"   # community prefix
-    O = "nginx.org/"                     # F5 prefix
+        P = "nginx.ingress.kubernetes.io/"   # community prefix
+        O = "nginx.org/"                     # F5 prefix
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    def ann(ia, key, default=''):
-        # community key, then already-F5 key, then default
-        if P + key in ia:           return ia[P + key]
-        if O + key in ia:           return ia[O + key]
-        return default
+        # ── Helpers ───────────────────────────────────────────────────────────────
+        def ann(ia, key, default=''):
+            # community key, then already-F5 key, then default
+            if P + key in ia:           return ia[P + key]
+            if O + key in ia:           return ia[O + key]
+            return default
 
-    def ann_any(ia, *keys):
-        for k in keys:
-            if k in ia:             return ia[k]
-        return ''
+        def ann_any(ia, *keys):
+            for k in keys:
+                if k in ia:             return ia[k]
+            return ''
 
-    def is_true(v):
-        return str(v).strip().lower() in ('true', 'on', '1', 'yes')
+        def is_true(v):
+            return str(v).strip().lower() in ('true', 'on', '1', 'yes')
 
-    def with_s(v):
-        v = str(v).strip()
-        if not v:                   return ''
-        return v if re.search(r'[a-zA-Z]$', v) else v + 's'
+        def with_s(v):
+            v = str(v).strip()
+            if not v:                   return ''
+            return v if re.search(r'[a-zA-Z]$', v) else v + 's'
 
-    def services_of(ing):
-        svcs = []
-        for rule in ing.get('spec', {}).get('rules', []):
-            for p in (rule.get('http', {}) or {}).get('paths', []):
-                n = p.get('backend', {}).get('service', {}).get('name', '')
-                if n and n not in svcs:
-                    svcs.append(n)
-        return svcs
+        def services_of(ing):
+            svcs = []
+            for rule in ing.get('spec', {}).get('rules', []):
+                for p in (rule.get('http', {}) or {}).get('paths', []):
+                    n = p.get('backend', {}).get('service', {}).get('name', '')
+                    if n and n not in svcs:
+                        svcs.append(n)
+            return svcs
 
-    def host_paths(ing, host):
-        # http paths attached to a given host on this ingress
-        out = []
-        for rule in ing.get('spec', {}).get('rules', []):
-            if rule.get('host', '') == host:
-                out.extend((rule.get('http', {}) or {}).get('paths', []))
-        return out
+        def host_paths(ing, host):
+            # http paths attached to a given host on this ingress
+            out = []
+            for rule in ing.get('spec', {}).get('rules', []):
+                if rule.get('host', '') == host:
+                    out.extend((rule.get('http', {}) or {}).get('paths', []))
+            return out
 
-    # ── Per-source translation ─────────────────────────────────────────────────
-    def translate(ing):
-        ia   = ing.get('metadata', {}).get('annotations', {})
-        name = ing['metadata']['name']
-        svcs = services_of(ing)
-        server = {}      # master-eligible / server context
-        location = {}    # minion-eligible / location+upstream context
-        dropped, flagged, unsupported = {}, {}, {}
+        # ── Per-source translation ─────────────────────────────────────────────────
+        def translate(ing):
+            ia   = ing.get('metadata', {}).get('annotations', {})
+            name = ing['metadata']['name']
+            svcs = services_of(ing)
+            server = {}      # master-eligible / server context
+            location = {}    # minion-eligible / location+upstream context
+            dropped, flagged, unsupported = {}, {}, {}
 
-        # -- timeouts (location) --
-        for ck, ok in [('proxy-connect-timeout', 'proxy-connect-timeout'),
-                       ('proxy-read-timeout',    'proxy-read-timeout'),
-                       ('proxy-send-timeout',    'proxy-send-timeout')]:
-            v = ann(ia, ck)
-            if v:
-                location[O + ok] = with_s(v)
+            # -- timeouts (location) --
+            for ck, ok in [('proxy-connect-timeout', 'proxy-connect-timeout'),
+                           ('proxy-read-timeout',    'proxy-read-timeout'),
+                           ('proxy-send-timeout',    'proxy-send-timeout')]:
+                v = ann(ia, ck)
+                if v:
+                    location[O + ok] = with_s(v)
 
-        # -- buffering / body size (location) --
-        if ann(ia, 'proxy-body-size'):
-            location[O + 'client-max-body-size'] = ann(ia, 'proxy-body-size')
-        if ann(ia, 'client-body-buffer-size'):
-            location[O + 'client-body-buffer-size'] = ann(ia, 'client-body-buffer-size')
-        if ann(ia, 'proxy-buffer-size'):
-            location[O + 'proxy-buffer-size'] = ann(ia, 'proxy-buffer-size')
-        if ann(ia, 'proxy-buffering'):
-            location[O + 'proxy-buffering'] = 'True' if is_true(ann(ia, 'proxy-buffering')) else 'False'
-        if ann(ia, 'proxy-buffers-number'):
-            num  = ann(ia, 'proxy-buffers-number')
-            size = ann(ia, 'proxy-buffer-size') or '4k'
-            location[O + 'proxy-buffers'] = f"{num} {size}"
-        if ann(ia, 'proxy-busy-buffers-size'):
-            location[O + 'proxy-busy-buffers-size'] = ann(ia, 'proxy-busy-buffers-size')
+            # -- buffering / body size (location) --
+            if ann(ia, 'proxy-body-size'):
+                location[O + 'client-max-body-size'] = ann(ia, 'proxy-body-size')
+            if ann(ia, 'client-body-buffer-size'):
+                location[O + 'client-body-buffer-size'] = ann(ia, 'client-body-buffer-size')
+            if ann(ia, 'proxy-buffer-size'):
+                location[O + 'proxy-buffer-size'] = ann(ia, 'proxy-buffer-size')
+            if ann(ia, 'proxy-buffering'):
+                location[O + 'proxy-buffering'] = 'True' if is_true(ann(ia, 'proxy-buffering')) else 'False'
+            if ann(ia, 'proxy-buffers-number'):
+                num  = ann(ia, 'proxy-buffers-number')
+                size = ann(ia, 'proxy-buffer-size') or '4k'
+                location[O + 'proxy-buffers'] = f"{num} {size}"
+            if ann(ia, 'proxy-busy-buffers-size'):
+                location[O + 'proxy-busy-buffers-size'] = ann(ia, 'proxy-busy-buffers-size')
 
-        # -- next-upstream (location) --
-        if ann(ia, 'proxy-next-upstream'):
-            location[O + 'proxy-next-upstream'] = ann(ia, 'proxy-next-upstream')
-        if ann(ia, 'proxy-next-upstream-timeout'):
-            location[O + 'proxy-next-upstream-timeout'] = with_s(ann(ia, 'proxy-next-upstream-timeout'))
-        if ann(ia, 'proxy-next-upstream-tries'):
-            location[O + 'proxy-next-upstream-tries'] = ann(ia, 'proxy-next-upstream-tries')
+            # -- next-upstream (location) --
+            if ann(ia, 'proxy-next-upstream'):
+                location[O + 'proxy-next-upstream'] = ann(ia, 'proxy-next-upstream')
+            if ann(ia, 'proxy-next-upstream-timeout'):
+                location[O + 'proxy-next-upstream-timeout'] = with_s(ann(ia, 'proxy-next-upstream-timeout'))
+            if ann(ia, 'proxy-next-upstream-tries'):
+                location[O + 'proxy-next-upstream-tries'] = ann(ia, 'proxy-next-upstream-tries')
 
-        # -- load balancing (location) --
-        if ann(ia, 'load-balance'):
-            location[O + 'lb-method'] = ann(ia, 'load-balance')
+            # -- load balancing (location) --
+            if ann(ia, 'load-balance'):
+                location[O + 'lb-method'] = ann(ia, 'load-balance')
 
-        # -- backend protocol HTTPS -> ssl-services (location) --
-        if ann(ia, 'backend-protocol').upper() == 'HTTPS' and svcs:
-            location[O + 'ssl-services'] = ",".join(svcs)
+            # -- backend protocol HTTPS -> ssl-services (location) --
+            if ann(ia, 'backend-protocol').upper() == 'HTTPS' and svcs:
+                location[O + 'ssl-services'] = ",".join(svcs)
 
-        # -- session affinity (location) — ONLY when annotated --
-        if ann(ia, 'affinity').lower() == 'cookie':
-            cookie = ann(ia, 'session-cookie-name') or 'route'
-            expires = ann(ia, 'session-cookie-expires') or ann(ia, 'session-cookie-max-age')
-            path = ann(ia, 'session-cookie-path') or '/'
-            entries = []
-            for s in svcs:
-                parts = [f"serviceName={s}", cookie]
-                if expires:
-                    parts.append(f"expires={with_s(expires)}")
-                parts.append(f"path={path}")
-                entries.append(" ".join(parts))
-            if entries:
-                location[O + 'sticky-cookie-services'] = ";".join(entries)
+            # -- session affinity (location) — ONLY when annotated --
+            if ann(ia, 'affinity').lower() == 'cookie':
+                cookie = ann(ia, 'session-cookie-name') or 'route'
+                expires = ann(ia, 'session-cookie-expires') or ann(ia, 'session-cookie-max-age')
+                path = ann(ia, 'session-cookie-path') or '/'
+                entries = []
+                for s in svcs:
+                    parts = [f"serviceName={s}", cookie]
+                    if expires:
+                        parts.append(f"expires={with_s(expires)}")
+                    parts.append(f"path={path}")
+                    entries.append(" ".join(parts))
+                if entries:
+                    location[O + 'sticky-cookie-services'] = ";".join(entries)
 
-        # -- rewrites (location) --
-        rewrite = ann(ia, 'rewrite-target')
-        use_regex = is_true(ann(ia, 'use-regex'))
-        if rewrite:
-            if use_regex or '$' in rewrite:
-                # regex capture-group rewrite -> rewrite-target + path-regex
-                location[O + 'rewrite-target'] = rewrite
-                location[O + 'path-regex'] = 'case_sensitive'
-            else:
-                # simple per-service path rewrite
-                location[O + 'rewrites'] = ";".join(
-                    f"serviceName={s} rewrite={rewrite}" for s in svcs)
+            # -- rewrites (location) --
+            rewrite = ann(ia, 'rewrite-target')
+            use_regex = is_true(ann(ia, 'use-regex'))
+            if rewrite:
+                if use_regex or '$' in rewrite:
+                    # regex capture-group rewrite -> rewrite-target + path-regex
+                    location[O + 'rewrite-target'] = rewrite
+                    location[O + 'path-regex'] = 'case_sensitive'
+                else:
+                    # simple per-service path rewrite
+                    location[O + 'rewrites'] = ";".join(
+                        f"serviceName={s} rewrite={rewrite}" for s in svcs)
 
-        # -- proxy-set-headers (location): upstream-vhost / x-forwarded-prefix --
-        psh = []
-        if ann(ia, 'upstream-vhost'):
-            psh.append(f"Host: {ann(ia, 'upstream-vhost')}")
-        if ann(ia, 'x-forwarded-prefix'):
-            psh.append(f"X-Forwarded-Prefix: {ann(ia, 'x-forwarded-prefix')}")
-        if psh:
-            location[O + 'proxy-set-headers'] = ",".join(psh)
+            # -- proxy-set-headers (location): upstream-vhost / x-forwarded-prefix --
+            psh = []
+            if ann(ia, 'upstream-vhost'):
+                psh.append(f"Host: {ann(ia, 'upstream-vhost')}")
+            if ann(ia, 'x-forwarded-prefix'):
+                psh.append(f"X-Forwarded-Prefix: {ann(ia, 'x-forwarded-prefix')}")
+            if psh:
+                location[O + 'proxy-set-headers'] = ",".join(psh)
 
-        # -- configuration-snippet -> location-snippets (location) --
-        if ia.get(P + 'configuration-snippet'):
-            location[O + 'location-snippets'] = ia[P + 'configuration-snippet']
+            # -- configuration-snippet -> location-snippets (location) --
+            if ia.get(P + 'configuration-snippet'):
+                location[O + 'location-snippets'] = ia[P + 'configuration-snippet']
 
-        # -- server-snippet -> server-snippets (server) --
-        if ia.get(P + 'server-snippet'):
-            server[O + 'server-snippets'] = ia[P + 'server-snippet']
+            # -- server-snippet -> server-snippets (server) --
+            if ia.get(P + 'server-snippet'):
+                server[O + 'server-snippets'] = ia[P + 'server-snippet']
 
-        # -- app-root (server) --
-        if ann(ia, 'app-root'):
-            server[O + 'app-root'] = ann(ia, 'app-root')
+            # -- app-root (server) --
+            if ann(ia, 'app-root'):
+                server[O + 'app-root'] = ann(ia, 'app-root')
 
-        # -- redirects (server) --
-        force_ssl = is_true(ann(ia, 'force-ssl-redirect'))
-        ssl_redir = is_true(ann_any(ia, P + 'ssl-redirect', O + 'ssl-redirect',
-                                    'ingress.kubernetes.io/ssl-redirect'))
-        if force_ssl:
-            server[O + 'redirect-to-https'] = 'true'
-            server[O + 'http-redirect-code'] = '308'   # preserves method+body
-        elif ssl_redir:
-            server[O + 'ssl-redirect'] = 'true'
-            server[O + 'http-redirect-code'] = '301'
+            # -- redirects (server) --
+            force_ssl = is_true(ann(ia, 'force-ssl-redirect'))
+            ssl_redir = is_true(ann_any(ia, P + 'ssl-redirect', O + 'ssl-redirect',
+                                        'ingress.kubernetes.io/ssl-redirect'))
+            if force_ssl:
+                server[O + 'redirect-to-https'] = 'true'
+                server[O + 'http-redirect-code'] = '308'   # preserves method+body
+            elif ssl_redir:
+                server[O + 'ssl-redirect'] = 'true'
+                server[O + 'http-redirect-code'] = '301'
 
-        # -- HSTS (server) — native annotations --
-        hsts_on = is_true(ann(ia, 'hsts')) or hsts_default
-        if hsts_on:
-            server[O + 'hsts'] = 'true'
-            server[O + 'hsts-max-age'] = ann(ia, 'hsts-max-age') or '31536000'
-            if is_true(ann(ia, 'hsts-include-subdomains')):
-                server[O + 'hsts-include-subdomains'] = 'true'
-            # NOTE: hsts-preload has no separate F5 annotation; preload is
-            # included automatically by nginx.org/hsts.
+            # -- HSTS (server) — native annotations --
+            hsts_on = is_true(ann(ia, 'hsts')) or hsts_default
+            if hsts_on:
+                server[O + 'hsts'] = 'true'
+                server[O + 'hsts-max-age'] = ann(ia, 'hsts-max-age') or '31536000'
+                if is_true(ann(ia, 'hsts-include-subdomains')):
+                    server[O + 'hsts-include-subdomains'] = 'true'
+                # NOTE: hsts-preload has no separate F5 annotation; preload is
+                # included automatically by nginx.org/hsts.
 
-        # -- CORS -> Policy (handled by caller; just surface the values) --
-        cors_on = is_true(ann(ia, 'enable-cors')) or cors_default
-        cors = None
-        if cors_on:
-            headers = [h.strip() for h in
-                       (ann(ia, 'cors-allow-headers')
-                        or 'Authorization,Content-Type,Accept,X-Requested-With').split(',')
-                       if h.strip() and h.strip().lower() != 'origin']  # Origin forbidden
-            methods = [m.strip() for m in
-                       (ann(ia, 'cors-allow-methods')
-                        or 'GET,POST,PUT,DELETE,PATCH,OPTIONS').split(',') if m.strip()]
-            cors = {
-                'origin':  ann(ia, 'cors-allow-origin') or f"https://{primary_host}",
-                'methods': methods,
-                'headers': headers,
-                'creds':   ann(ia, 'cors-allow-credentials') or 'true',
-                'maxage':  ann(ia, 'cors-max-age') or '86400',
+            # -- CORS -> Policy (handled by caller; just surface the values) --
+            cors_on = is_true(ann(ia, 'enable-cors')) or cors_default
+            cors = None
+            if cors_on:
+                headers = [h.strip() for h in
+                           (ann(ia, 'cors-allow-headers')
+                            or 'Authorization,Content-Type,Accept,X-Requested-With').split(',')
+                           if h.strip() and h.strip().lower() != 'origin']  # Origin forbidden
+                methods = [m.strip() for m in
+                           (ann(ia, 'cors-allow-methods')
+                            or 'GET,POST,PUT,DELETE,PATCH,OPTIONS').split(',') if m.strip()]
+                cors = {
+                    'origin':  ann(ia, 'cors-allow-origin') or f"https://{primary_host}",
+                    'methods': methods,
+                    'headers': headers,
+                    'creds':   ann(ia, 'cors-allow-credentials') or 'true',
+                    'maxage':  ann(ia, 'cors-max-age') or '86400',
+                }
+
+            # -- DROPPED --
+            for k in [P + 'certificate-arn', 'kubectl.kubernetes.io/last-applied-configuration',
+                      'ingress.kubernetes.io/secure-backends', 'ingress.kubernetes.io/backend-protocol',
+                      P + 'http2-push-preload']:
+                if k in ia:
+                    dropped[k] = ia[k]
+
+            # -- FLAGGED (manual / ConfigMap / Policy) --
+            if ann(ia, 'keep-alive-timeout'):
+                flagged[P + 'keep-alive-timeout'] = "keepalive-timeout is a duration; set ConfigMap key 'keepalive-timeout' (nginx.org/keepalive is a connection count, not a timeout)"
+            if ia.get(P + 'custom-http-errors') or ia.get(P + 'default-backend'):
+                flagged['custom-http-errors/default-backend'] = "No Ingress annotation; configure via VS errorPages or default-backend manually"
+            for k in ['whitelist-source-range', 'denylist-source-range']:
+                if ann(ia, k):
+                    flagged[P + k] = "Map to accessControl Policy + nginx.org/policies (not auto-generated in v1)"
+            for k in ['enable-modsecurity', 'enable-owasp-core-rules', 'modsecurity-snippet']:
+                if ia.get(P + k):
+                    flagged[P + k] = "WAF — configure F5 WAF for NGINX Policy manually"
+            for k in ['auth-type', 'auth-secret', 'auth-tls-secret', 'auth-tls-verify-client']:
+                if ia.get(P + k):
+                    flagged[P + k] = "Auth — map to basicAuth/ingressMTLS Policy manually (not in v1)"
+            for k in ['mirror-target', 'mirror-request-body', 'mirror-host']:
+                if ia.get(P + k):
+                    flagged[P + k] = "Request mirroring — use server/location-snippets manually"
+            if ia.get(P + 'enable-opentelemetry'):
+                flagged[P + 'enable-opentelemetry'] = "OpenTelemetry is global ConfigMap-only in F5 (otel-trace-in-http)"
+
+            # -- UNSUPPORTED: any other community annotation we did not handle --
+            handled_suffixes = {
+                'proxy-connect-timeout','proxy-read-timeout','proxy-send-timeout',
+                'proxy-body-size','client-body-buffer-size','proxy-buffer-size',
+                'proxy-buffering','proxy-buffers-number','proxy-busy-buffers-size',
+                'proxy-next-upstream','proxy-next-upstream-timeout','proxy-next-upstream-tries',
+                'load-balance','backend-protocol','affinity','session-cookie-name',
+                'session-cookie-expires','session-cookie-max-age','session-cookie-path',
+                'rewrite-target','use-regex','upstream-vhost','x-forwarded-prefix',
+                'configuration-snippet','server-snippet','app-root','force-ssl-redirect',
+                'ssl-redirect','hsts','hsts-max-age','hsts-include-subdomains','hsts-preload',
+                'enable-cors','cors-allow-headers','cors-allow-methods','cors-allow-origin',
+                'cors-allow-credentials','cors-max-age','certificate-arn','http2-push-preload',
+                'keep-alive-timeout','custom-http-errors','default-backend',
+                'whitelist-source-range','denylist-source-range','enable-modsecurity',
+                'enable-owasp-core-rules','modsecurity-snippet','modsecurity-transaction-id',
+                'auth-type','auth-secret','auth-realm','auth-secret-type','auth-tls-secret',
+                'auth-tls-verify-client','auth-tls-verify-depth','auth-tls-error-page',
+                'auth-tls-pass-certificate-to-upstream','mirror-target','mirror-request-body',
+                'mirror-host','enable-opentelemetry','opentelemetry-trust-incoming-span',
+            }
+            for k in ia:
+                if k.startswith(P):
+                    suf = k[len(P):]
+                    if (suf not in handled_suffixes and k not in dropped and k not in flagged):
+                        unsupported[k] = ia[k]
+
+            return {
+                'name': name, 'services': svcs, 'server': server, 'location': location,
+                'cors': cors, 'dropped': dropped, 'flagged': flagged,
+                'unsupported': unsupported,
+                'helm_managed': 'meta.helm.sh/release-name' in ia,
+                'helm_release': ia.get('meta.helm.sh/release-name', ''),
             }
 
-        # -- DROPPED --
-        for k in [P + 'certificate-arn', 'kubectl.kubernetes.io/last-applied-configuration',
-                  'ingress.kubernetes.io/secure-backends', 'ingress.kubernetes.io/backend-protocol',
-                  P + 'http2-push-preload']:
-            if k in ia:
-                dropped[k] = ia[k]
+        # ── CORS Policy writer (official 5.4.x schema; Origin already removed) ──────
+        def write_cors_policy(cors, policy_name):
+            pol = {
+                'apiVersion': 'k8s.nginx.org/v1',
+                'kind': 'Policy',
+                'metadata': {
+                    'name': policy_name, 'namespace': namespace,
+                    'labels': {'app.kubernetes.io/managed-by': 'ansible',
+                               'migration-method': 'method2-cors-policy'},
+                },
+                'spec': {'cors': {
+                    'allowOrigin': [cors['origin']],
+                    'allowMethods': cors['methods'],
+                    'allowHeaders': cors['headers'],
+                    'allowCredentials': str(cors['creds']).lower() == 'true',
+                    'maxAge': int(str(cors['maxage'])) if str(cors['maxage']).isdigit() else cors['maxage'],
+                }},
+            }
+            fp = os.path.join(gen_path, f"{policy_name}.yaml")
+            with open(fp, 'w') as f:
+                yaml.safe_dump(pol, f, sort_keys=False, default_flow_style=False, width=4096)
+            os.chmod(fp, 0o600)
+            return {'policy_name': policy_name, 'filepath': fp}
 
-        # -- FLAGGED (manual / ConfigMap / Policy) --
-        if ann(ia, 'keep-alive-timeout'):
-            flagged[P + 'keep-alive-timeout'] = "keepalive-timeout is a duration; set ConfigMap key 'keepalive-timeout' (nginx.org/keepalive is a connection count, not a timeout)"
-        if ia.get(P + 'custom-http-errors') or ia.get(P + 'default-backend'):
-            flagged['custom-http-errors/default-backend'] = "No Ingress annotation; configure via VS errorPages or default-backend manually"
-        for k in ['whitelist-source-range', 'denylist-source-range']:
-            if ann(ia, k):
-                flagged[P + k] = "Map to accessControl Policy + nginx.org/policies (not auto-generated in v1)"
-        for k in ['enable-modsecurity', 'enable-owasp-core-rules', 'modsecurity-snippet']:
-            if ia.get(P + k):
-                flagged[P + k] = "WAF — configure F5 WAF for NGINX Policy manually"
-        for k in ['auth-type', 'auth-secret', 'auth-tls-secret', 'auth-tls-verify-client']:
-            if ia.get(P + k):
-                flagged[P + k] = "Auth — map to basicAuth/ingressMTLS Policy manually (not in v1)"
-        for k in ['mirror-target', 'mirror-request-body', 'mirror-host']:
-            if ia.get(P + k):
-                flagged[P + k] = "Request mirroring — use server/location-snippets manually"
-        if ia.get(P + 'enable-opentelemetry'):
-            flagged[P + 'enable-opentelemetry'] = "OpenTelemetry is global ConfigMap-only in F5 (otel-trace-in-http)"
+        def write_yaml(obj, fp):
+            with open(fp, 'w') as f:
+                yaml.safe_dump(obj, f, sort_keys=False, default_flow_style=False, width=4096)
+            os.chmod(fp, 0o600)
 
-        # -- UNSUPPORTED: any other community annotation we did not handle --
-        handled_suffixes = {
-            'proxy-connect-timeout','proxy-read-timeout','proxy-send-timeout',
-            'proxy-body-size','client-body-buffer-size','proxy-buffer-size',
-            'proxy-buffering','proxy-buffers-number','proxy-busy-buffers-size',
-            'proxy-next-upstream','proxy-next-upstream-timeout','proxy-next-upstream-tries',
-            'load-balance','backend-protocol','affinity','session-cookie-name',
-            'session-cookie-expires','session-cookie-max-age','session-cookie-path',
-            'rewrite-target','use-regex','upstream-vhost','x-forwarded-prefix',
-            'configuration-snippet','server-snippet','app-root','force-ssl-redirect',
-            'ssl-redirect','hsts','hsts-max-age','hsts-include-subdomains','hsts-preload',
-            'enable-cors','cors-allow-headers','cors-allow-methods','cors-allow-origin',
-            'cors-allow-credentials','cors-max-age','certificate-arn','http2-push-preload',
-            'keep-alive-timeout','custom-http-errors','default-backend',
-            'whitelist-source-range','denylist-source-range','enable-modsecurity',
-            'enable-owasp-core-rules','modsecurity-snippet','modsecurity-transaction-id',
-            'auth-type','auth-secret','auth-realm','auth-secret-type','auth-tls-secret',
-            'auth-tls-verify-client','auth-tls-verify-depth','auth-tls-error-page',
-            'auth-tls-pass-certificate-to-upstream','mirror-target','mirror-request-body',
-            'mirror-host','enable-opentelemetry','opentelemetry-trust-incoming-span',
+        def eff_host(h):
+            return test_host if test_mode else h
+
+        def f5name(n):
+            # idempotent -<original>-f5 naming (avoid double -f5)
+            return n if n.endswith('-f5') else f"{n}-f5"
+
+        # ── Load this unit's source Ingresses ──────────────────────────────────────
+        sources = []
+        for n in source_names:
+            with open(os.path.join(tmp_path, f"_ingress_{n}.json")) as f:
+                sources.append(json.load(f))
+        translations = [translate(s) for s in sources]
+
+        result = {
+            'primary_host': primary_host, 'unit_type': unit_type,
+            'effective_host': eff_host(primary_host),
+            'source_ingress_names': source_names,
+            'plain_files': [], 'master_files': [], 'minion_files': [], 'policy_files': [],
+            'unsupported': {}, 'dropped': {}, 'flagged': {},
+            'helm_managed': any(t['helm_managed'] for t in translations),
+            'helm_releases': sorted({t['helm_release'] for t in translations if t['helm_release']}),
+            'conflicts': [],
         }
-        for k in ia:
-            if k.startswith(P):
-                suf = k[len(P):]
-                if (suf not in handled_suffixes and k not in dropped and k not in flagged):
-                    unsupported[k] = ia[k]
+        for t in translations:
+            result['unsupported'].update(t['unsupported'])
+            result['dropped'].update(t['dropped'])
+            result['flagged'].update(t['flagged'])
 
-        return {
-            'name': name, 'services': svcs, 'server': server, 'location': location,
-            'cors': cors, 'dropped': dropped, 'flagged': flagged,
-            'unsupported': unsupported,
-            'helm_managed': 'meta.helm.sh/release-name' in ia,
-            'helm_release': ia.get('meta.helm.sh/release-name', ''),
-        }
+        # =====================================================================
+        # PLAIN unit (single source ingress; may be multi-host)
+        # =====================================================================
+        if unit_type == 'plain':
+            src = sources[0]
+            t   = translations[0]
+            ing_name = f5name(t['name'])
+            anns = {}
+            anns.update(t['server'])
+            anns.update(t['location'])
 
-    # ── CORS Policy writer (official 5.4.x schema; Origin already removed) ──────
-    def write_cors_policy(cors, policy_name):
-        pol = {
-            'apiVersion': 'k8s.nginx.org/v1',
-            'kind': 'Policy',
-            'metadata': {
-                'name': policy_name, 'namespace': namespace,
-                'labels': {'app.kubernetes.io/managed-by': 'ansible',
-                           'migration-method': 'method2-cors-policy'},
-            },
-            'spec': {'cors': {
-                'allowOrigin': [cors['origin']],
-                'allowMethods': cors['methods'],
-                'allowHeaders': cors['headers'],
-                'allowCredentials': str(cors['creds']).lower() == 'true',
-                'maxAge': int(str(cors['maxage'])) if str(cors['maxage']).isdigit() else cors['maxage'],
-            }},
-        }
-        fp = os.path.join(gen_path, f"{policy_name}.yaml")
-        with open(fp, 'w') as f:
-            yaml.safe_dump(pol, f, sort_keys=False, default_flow_style=False, width=4096)
-        os.chmod(fp, 0o600)
-        return {'policy_name': policy_name, 'filepath': fp}
+            # CORS policy + attach
+            if t['cors']:
+                pol_name = f"{ing_name}-cors"
+                pol = write_cors_policy(t['cors'], pol_name)
+                result['policy_files'].append(pol)
+                anns[O + 'policies'] = pol_name
 
-    def write_yaml(obj, fp):
-        with open(fp, 'w') as f:
-            yaml.safe_dump(obj, f, sort_keys=False, default_flow_style=False, width=4096)
-        os.chmod(fp, 0o600)
+            rules = []
+            for rule in src.get('spec', {}).get('rules', []):
+                r = json.loads(json.dumps(rule))   # deep copy
+                if r.get('host'):
+                    r['host'] = eff_host(r['host'])
+                rules.append(r)
 
-    def eff_host(h):
-        return test_host if test_mode else h
-
-    def f5name(n):
-        # idempotent -<original>-f5 naming (avoid double -f5)
-        return n if n.endswith('-f5') else f"{n}-f5"
-
-    # ── Load this unit's source Ingresses ──────────────────────────────────────
-    sources = []
-    for n in source_names:
-        with open(os.path.join(tmp_path, f"_ingress_{n}.json")) as f:
-            sources.append(json.load(f))
-    translations = [translate(s) for s in sources]
-
-    result = {
-        'primary_host': primary_host, 'unit_type': unit_type,
-        'effective_host': eff_host(primary_host),
-        'source_ingress_names': source_names,
-        'plain_files': [], 'master_files': [], 'minion_files': [], 'policy_files': [],
-        'unsupported': {}, 'dropped': {}, 'flagged': {},
-        'helm_managed': any(t['helm_managed'] for t in translations),
-        'helm_releases': sorted({t['helm_release'] for t in translations if t['helm_release']}),
-        'conflicts': [],
-    }
-    for t in translations:
-        result['unsupported'].update(t['unsupported'])
-        result['dropped'].update(t['dropped'])
-        result['flagged'].update(t['flagged'])
-
-    # =====================================================================
-    # PLAIN unit (single source ingress; may be multi-host)
-    # =====================================================================
-    if unit_type == 'plain':
-        src = sources[0]
-        t   = translations[0]
-        ing_name = f5name(t['name'])
-        anns = {}
-        anns.update(t['server'])
-        anns.update(t['location'])
-
-        # CORS policy + attach
-        if t['cors']:
-            pol_name = f"{ing_name}-cors"
-            pol = write_cors_policy(t['cors'], pol_name)
-            result['policy_files'].append(pol)
-            anns[O + 'policies'] = pol_name
-
-        rules = []
-        for rule in src.get('spec', {}).get('rules', []):
-            r = json.loads(json.dumps(rule))   # deep copy
-            if r.get('host'):
-                r['host'] = eff_host(r['host'])
-            rules.append(r)
-
-        ing = {
-            'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
-            'metadata': {'name': ing_name, 'namespace': namespace,
-                         'labels': {'app.kubernetes.io/managed-by': 'ansible',
-                                    'migration-method': 'method2-plain',
-                                    'migration-source-ingress': t['name']},
-                         'annotations': anns},
-            'spec': {'ingressClassName': new_class, 'rules': rules},
-        }
-        if tls_secret:
-            ing['spec']['tls'] = [{'hosts': [eff_host(h) for h in unit_hosts],
-                                   'secretName': tls_secret}]
-        fp = os.path.join(gen_path, f"{ing_name}.yaml")
-        write_yaml(ing, fp)
-        result['plain_files'].append({'name': ing_name, 'filepath': fp})
-
-    # =====================================================================
-    # MERGEABLE unit (master + one minion per source)
-    # =====================================================================
-    else:
-        # --- MASTER: server-level from the OLDEST source (sources are ctime-sorted
-        #     in unit building; index 0 = oldest = F5 host winner) ---
-        base_t = translations[0]
-        master_server = dict(base_t['server'])
-
-        # flag server-level disagreements across sources
-        for t in translations[1:]:
-            for k, v in t['server'].items():
-                if master_server.get(k, None) not in (None, v):
-                    result['conflicts'].append(
-                        {'annotation': k, 'master': master_server.get(k), 'source': t['name'], 'value': v})
-            # surface CORS disagreement too
-        master_name = f"{sanitized}-master-f5"
-        m_anns = {O + 'mergeable-ingress-type': 'master'}
-        m_anns.update(master_server)
-
-        # CORS policy attaches on the master (host-wide). Use oldest source's CORS.
-        cors_src = next((t for t in translations if t['cors']), None)
-        if cors_src:
-            pol_name = f"{sanitized}-cors"
-            pol = write_cors_policy(cors_src['cors'], pol_name)
-            result['policy_files'].append(pol)
-            m_anns[O + 'policies'] = pol_name
-            # flag if other sources requested different CORS
-            for t in translations:
-                if t['cors'] and t is not cors_src and t['cors'] != cors_src['cors']:
-                    result['conflicts'].append(
-                        {'annotation': 'cors', 'source': t['name'],
-                         'note': 'differing CORS ignored; one policy per host'})
-
-        master = {
-            'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
-            'metadata': {'name': master_name, 'namespace': namespace,
-                         'labels': {'app.kubernetes.io/managed-by': 'ansible',
-                                    'migration-method': 'method2-master'},
-                         'annotations': m_anns},
-            'spec': {'ingressClassName': new_class,
-                     'rules': [{'host': eff_host(primary_host)}]},   # NO paths on master
-        }
-        if tls_secret:
-            master['spec']['tls'] = [{'hosts': [eff_host(primary_host)],
-                                      'secretName': tls_secret}]
-        fp = os.path.join(gen_path, f"{master_name}.yaml")
-        write_yaml(master, fp)
-        result['master_files'].append({'name': master_name, 'filepath': fp})
-
-        # --- MINIONS: one per source, location-level annotations + that
-        #     source's paths. No TLS, no server-level annotations. ---
-        for src, t in zip(sources, translations):
-            minion_name = f5name(t['name'])
-            mi_anns = {O + 'mergeable-ingress-type': 'minion'}
-            mi_anns.update(t['location'])
-            paths = host_paths(src, primary_host)
-            minion = {
+            ing = {
                 'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
-                'metadata': {'name': minion_name, 'namespace': namespace,
+                'metadata': {'name': ing_name, 'namespace': namespace,
                              'labels': {'app.kubernetes.io/managed-by': 'ansible',
-                                        'migration-method': 'method2-minion',
+                                        'migration-method': 'method2-plain',
                                         'migration-source-ingress': t['name']},
-                             'annotations': mi_anns},
-                'spec': {'ingressClassName': new_class,
-                         'rules': [{'host': eff_host(primary_host),
-                                    'http': {'paths': paths}}]},
+                             'annotations': anns},
+                'spec': {'ingressClassName': new_class, 'rules': rules},
             }
-            fp = os.path.join(gen_path, f"{minion_name}.yaml")
-            write_yaml(minion, fp)
-            result['minion_files'].append({'name': minion_name, 'filepath': fp})
+            if tls_secret:
+                ing['spec']['tls'] = [{'hosts': [eff_host(h) for h in unit_hosts],
+                                       'secretName': tls_secret}]
+            fp = os.path.join(gen_path, f"{ing_name}.yaml")
+            write_yaml(ing, fp)
+            result['plain_files'].append({'name': ing_name, 'filepath': fp})
 
-    print(json.dumps(result))
-    PYEOF
-  args:
-    executable: /bin/bash
+        # =====================================================================
+        # MERGEABLE unit (master + one minion per source)
+        # =====================================================================
+        else:
+            # --- MASTER: server-level from the OLDEST source (sources are ctime-sorted
+            #     in unit building; index 0 = oldest = F5 host winner) ---
+            base_t = translations[0]
+            master_server = dict(base_t['server'])
+
+            # flag server-level disagreements across sources
+            for t in translations[1:]:
+                for k, v in t['server'].items():
+                    if master_server.get(k, None) not in (None, v):
+                        result['conflicts'].append(
+                            {'annotation': k, 'master': master_server.get(k), 'source': t['name'], 'value': v})
+                # surface CORS disagreement too
+            master_name = f"{sanitized}-master-f5"
+            m_anns = {O + 'mergeable-ingress-type': 'master'}
+            m_anns.update(master_server)
+
+            # CORS policy attaches on the master (host-wide). Use oldest source's CORS.
+            cors_src = next((t for t in translations if t['cors']), None)
+            if cors_src:
+                pol_name = f"{sanitized}-cors"
+                pol = write_cors_policy(cors_src['cors'], pol_name)
+                result['policy_files'].append(pol)
+                m_anns[O + 'policies'] = pol_name
+                # flag if other sources requested different CORS
+                for t in translations:
+                    if t['cors'] and t is not cors_src and t['cors'] != cors_src['cors']:
+                        result['conflicts'].append(
+                            {'annotation': 'cors', 'source': t['name'],
+                             'note': 'differing CORS ignored; one policy per host'})
+
+            master = {
+                'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
+                'metadata': {'name': master_name, 'namespace': namespace,
+                             'labels': {'app.kubernetes.io/managed-by': 'ansible',
+                                        'migration-method': 'method2-master'},
+                             'annotations': m_anns},
+                'spec': {'ingressClassName': new_class,
+                         'rules': [{'host': eff_host(primary_host)}]},   # NO paths on master
+            }
+            if tls_secret:
+                master['spec']['tls'] = [{'hosts': [eff_host(primary_host)],
+                                          'secretName': tls_secret}]
+            fp = os.path.join(gen_path, f"{master_name}.yaml")
+            write_yaml(master, fp)
+            result['master_files'].append({'name': master_name, 'filepath': fp})
+
+            # --- MINIONS: one per source, location-level annotations + that
+            #     source's paths. No TLS, no server-level annotations. ---
+            for src, t in zip(sources, translations):
+                minion_name = f5name(t['name'])
+                mi_anns = {O + 'mergeable-ingress-type': 'minion'}
+                mi_anns.update(t['location'])
+                paths = host_paths(src, primary_host)
+                minion = {
+                    'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
+                    'metadata': {'name': minion_name, 'namespace': namespace,
+                                 'labels': {'app.kubernetes.io/managed-by': 'ansible',
+                                            'migration-method': 'method2-minion',
+                                            'migration-source-ingress': t['name']},
+                                 'annotations': mi_anns},
+                    'spec': {'ingressClassName': new_class,
+                             'rules': [{'host': eff_host(primary_host),
+                                        'http': {'paths': paths}}]},
+                }
+                fp = os.path.join(gen_path, f"{minion_name}.yaml")
+                write_yaml(minion, fp)
+                result['minion_files'].append({'name': minion_name, 'filepath': fp})
+
+        print(json.dumps(result))
+
+  tags: f5-nginx-migrate
+
+# Looped per unit. The script is static (the 400-line body never passes through
+# the shell arg-splitter, which mis-reads Python '}}' as a Jinja close); the
+# per-iteration index is passed via the UNIT_INDEX environment variable.
+- name: "[Step 4] Generate Ingress / master+minion / Policy YAMLs"
+  ansible.builtin.command: "python3 {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_generate_unit.py"
+  environment:
+    UNIT_INDEX: "{{ unit_index }}"
   loop: "{{ _units }}"
   loop_control:
     index_var: unit_index
@@ -992,6 +1001,7 @@
   register: _parse_results
   changed_when: true
   tags: f5-nginx-migrate
+
 
 - name: "[Step 4] Collect parse results"
   ansible.builtin.set_fact:
