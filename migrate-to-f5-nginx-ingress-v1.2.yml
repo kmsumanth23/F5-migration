@@ -1,0 +1,1777 @@
+---
+# =============================================================================
+# Task File : migrate-to-f5-nginx-ingress-v1.2.yml
+# Version   : 1.2
+# Method    : Method 2 — F5 Ingress with nginx.org/* annotations
+#             (plain Ingress for unique hosts, mergeable master/minion for
+#              shared hosts). CORS via Policy CRD attached with nginx.org/policies.
+#
+# v1.2 CHANGES (from second hxun run + 'proper migrated yml' review):
+#   G1  DEFAULT CORS/HSTS restored: if a host group has neither configured,
+#       a default CORS Policy is generated+attached and default HSTS
+#       annotations are added (toggles cors_default_enable /
+#       hsts_default_enable, now default TRUE). CORS stays Policy CRD,
+#       HSTS stays native annotations — never server-snippets.
+#   G2  Labels removed from all generated objects (clean YAMLs).
+#       Self-exclusion on re-runs now uses the '-test' name suffix.
+#   G3  PSEUDO-ANNOTATION handling: nginx.org/enable-cors + nginx.org/cors-*
+#       do NOT exist in F5 (inert) — their intent is converted into the CORS
+#       Policy CRD (Origin stripped from allowHeaders). nginx.org/default-server,
+#       nginx.org/enable-underscores-in-headers, nginx.org/hsts-preload are
+#       flagged as inert with the correct ConfigMap/no-op guidance.
+#   G4  MIXED sources (community class but hand-added nginx.org/* annotations,
+#       like the real hcl-unica-demo-f5): genuine F5 annotations are routed
+#       verbatim (server-level -> master, rest -> minion) after community
+#       translation; nothing falls through silently.
+#   G5  Unit CORS priority: adoptee intent > oldest source > default.
+#   G6  Members with no paths for the host contribute server-level config
+#       only (no empty minion emitted) — makes post-cutover re-runs over an
+#       existing master+minion set idempotent.
+#
+# v1.1 CHANGES (from hxun run findings):
+#   F1  ADOPTION: inventory now includes already-migrated F5 ingresses
+#       (new IngressClass, no migration-method label = "adoptee").
+#       - Adoptee sharing a host with others => routed into the mergeable
+#         master/minion set. Its nginx.org/* annotations are kept VERBATIM
+#         (no translation), only ROUTED: server-level -> master,
+#         location-level -> its own minion. Its spec.tls becomes master TLS.
+#       - Adoptee with a unique host => 'validated' unit: left untouched,
+#         reported as correctly migrated.
+#       - Adoptee server-level config WINS over translated sources on
+#         conflict (it is the human-validated F5 state); conflicts flagged.
+#   F2  ssl-redirect is now THREE-STATE: explicit "false" translates to
+#       nginx.org/ssl-redirect: "false" (prevents the F5-default-True
+#       ALB redirect loop documented in the POC). Absence stays absent.
+#   F3  path-regex default is case_insensitive (community use-regex compiles
+#       to ~* — case-insensitive; case_sensitive broke /Aion-style requests).
+#   F4  AUDIT: every annotation on every source/adoptee gets an explicit
+#       disposition (translated -> X / routed / dropped / flagged /
+#       unsupported / no-op-with-reason). Step 4c prints the full audit;
+#       nothing can be skipped silently.
+#   F5  Conflict check excludes the unit members themselves (sources +
+#       adoptees own the real host legitimately until cutover).
+#   F6  test_mode object names get a '-test' suffix so a test apply can
+#       NEVER overwrite a live adoptee Ingress of the same name.
+#   F7  Multi-host plain units in test_mode map each extra host to a
+#       deterministic unique test host (t1-<test_host>, ...) instead of
+#       producing duplicate-host rules. Per-host TLS structure preserved.
+#   F8  Host-less ingresses (default-backend style) => 'skipped' unit, flagged.
+#   F9  Step 6 acceptance polls events with retries; an EMPTY event after
+#       retries is a WARNING (not a silent pass, not a rollback).
+#   F10 Grouping + conflict scripts moved to copy-to-file pattern (no large
+#       Python through the shell arg-splitter — the v1 bastion parse bug).
+#
+# Annotation routing in a mergeable set (official master/minion rules):
+#   MASTER  : tls, ssl-redirect/redirect-to-https/http-redirect-code, hsts*,
+#             server-snippets, server-tokens, proxy-hide/pass-headers,
+#             listen-ports*, app-root, nginx.org/policies (CORS)
+#   MINION  : rewrites / rewrite-target+path-regex, ssl-services,
+#             sticky-cookie-services, proxy-set-headers, timeouts, buffers,
+#             client-max-body-size, lb-method, location-snippets, limit-req*
+#
+# Steps:
+#   0/0b  Variables + assertions
+#   1     Pre-flight (F5 IngressClass + Policy CRD + cors schema)
+#   2     Inventory: old-class sources AND new-class adoptees
+#         (our own generated objects — migration-method label — excluded)
+#   2b    Build units (plain / mergeable / validated / skipped) + dirs
+#   3/3b  Backup + write JSONs
+#   4     Generate (translate sources, adopt adoptees, master/minion split)
+#   4b    Reports (unsupported / dropped / flagged / conflicts)
+#   4c    FULL annotation audit (every annotation -> disposition)
+#   4d    Conflict detection (excludes unit members + generated names)
+#   5/5b  Summary + cutover plan + Helm warning
+#   5c    Apply (test-suffixed names, test_host)
+#   6     Poll controller events (retries); assert no Rejected
+#   6r    Rollback test-applied objects on rejection
+#
+# DEFERRED to v2: curl tests, log analysis, atomic switch (cutover_plan is
+# already computed per unit: delete sources, convert adoptees to minions).
+# =============================================================================
+
+
+# ── 0. Variables ──────────────────────────────────────────────────────────────
+- name: "[Step 0] Derive F5 naming from env"
+  ansible.builtin.set_fact:
+    _env_f5_namespace: >-
+      {{ 'nginx-ingress-f5-prd' if (migration_item.env | default('np')) == 'prd'
+         else 'nginx-ingress-f5' }}
+    _env_f5_release: >-
+      {{ 'f5-nginx-prd' if (migration_item.env | default('np')) == 'prd'
+         else 'f5-nginx' }}
+    _env_new_class: >-
+      {{ 'nginx-f5-PRD' if (migration_item.env | default('np')) == 'prd'
+         else 'nginx-f5' }}
+  tags: f5-nginx-migrate
+
+- name: "[Step 0] Set migration variables"
+  ansible.builtin.set_fact:
+    _mig_namespace:      "{{ migration_item.namespace }}"
+    _mig_old_class:      "{{ migration_item.old_ingress_class }}"
+    _mig_new_class:      "{{ migration_item.new_ingress_class | default(_env_new_class) }}"
+    _mig_f5_namespace:   "{{ migration_item.f5_namespace | default(_env_f5_namespace) }}"
+    _mig_f5_release:     "{{ migration_item.f5_release_name | default(_env_f5_release) }}"
+    _mig_dry_run:        "{{ migration_item.dry_run | default(true) | bool }}"
+    _mig_auto_rollback:  "{{ migration_item.auto_rollback | default(true) | bool }}"
+    _mig_backup_path:    "{{ migration_item.backup_path }}"
+    _mig_multi:          "{{ migration_item.multi | default(false) | bool }}"
+    _mig_ingress_name:   "{{ migration_item.ingress_name | default('') }}"
+    _mig_test_mode:      "{{ migration_item.test_mode | default(true) | bool }}"
+    _mig_test_host:      "{{ migration_item.test_host | default('') }}"
+    _mig_atomic_switch:  "{{ migration_item.atomic_switch | default(false) | bool }}"
+    # Method 2 toggles
+    _mig_use_mergeable:  "{{ migration_item.use_mergeable | default(true) | bool }}"
+    _mig_adopt_migrated: "{{ migration_item.adopt_migrated | default(true) | bool }}"
+    _mig_cors_default:   "{{ migration_item.cors_default_enable | default(true) | bool }}"
+    _mig_hsts_default:   "{{ migration_item.hsts_default_enable | default(true) | bool }}"
+    # generated trackers
+    _mig_generated_ing:    []
+    _mig_generated_master: []
+    _mig_generated_minion: []
+    _mig_generated_pol:    []
+    _mig_rollback_needed:  false
+  tags: f5-nginx-migrate
+
+
+# ── 0b. Assertions ────────────────────────────────────────────────────────────
+- name: "[Step 0b] Assert backup_path"
+  ansible.builtin.assert:
+    that:
+      - migration_item.backup_path is defined
+      - migration_item.backup_path | length > 0
+    fail_msg: "migration_item.backup_path required. Pattern: /apps/<client>/<env>/utils"
+  tags: f5-nginx-migrate
+
+- name: "[Step 0b] Assert mode"
+  ansible.builtin.assert:
+    that: (_mig_multi | bool) or (_mig_ingress_name | length > 0)
+    fail_msg: "Set migration_item.ingress_name (single) or migration_item.multi: true (multi)."
+  tags: f5-nginx-migrate
+
+- name: "[Step 0b] Assert test_host"
+  ansible.builtin.assert:
+    that: _mig_test_host | length > 0
+    fail_msg: "migration_item.test_host required when test_mode: true."
+  when: _mig_test_mode | bool
+  tags: f5-nginx-migrate
+
+- name: "[Step 0b] Display configuration"
+  ansible.builtin.debug:
+    msg:
+      - "================================================================"
+      - " F5 NGINX Migration — METHOD 2 (Ingress + nginx.org/*) — v1.2"
+      - " Mode             : {{ 'MULTI' if _mig_multi else 'SINGLE' }}"
+      - "================================================================"
+      - "  Namespace        : {{ _mig_namespace }}"
+      - "  Old IngressClass : {{ _mig_old_class }}"
+      - "  New IngressClass : {{ _mig_new_class }}"
+      - "  Adopt migrated   : {{ _mig_adopt_migrated }}"
+      - "  F5 Namespace     : {{ _mig_f5_namespace }}"
+      - "  Env              : {{ migration_item.env | default('np') }}"
+      - "  Dry Run          : {{ _mig_dry_run }}"
+      - "  Test Mode        : {{ _mig_test_mode }}{{ ' (objects suffixed -test)' if _mig_test_mode else '' }}"
+      - "  Test Host        : {{ _mig_test_host if _mig_test_mode else 'N/A' }}"
+      - "  Use Mergeable    : {{ _mig_use_mergeable }}"
+      - "  Backup Path      : {{ _mig_backup_path }}"
+      - "================================================================"
+  tags: f5-nginx-migrate
+
+
+# ── 1. Pre-flight ─────────────────────────────────────────────────────────────
+- name: "[Step 1] Verify F5 IngressClass"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl get ingressclass {{ _mig_new_class }} -o name
+  register: _f5_class_check
+  changed_when: false
+  failed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 1] Assert F5 IngressClass"
+  ansible.builtin.assert:
+    that: _f5_class_check.rc == 0
+    fail_msg: "F5 IngressClass '{{ _mig_new_class }}' not found. Install F5 NGINX first."
+    success_msg: "✅ F5 IngressClass '{{ _mig_new_class }}' present"
+  tags: f5-nginx-migrate
+
+- name: "[Step 1] Verify Policy CRD (CORS)"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl get crd policies.k8s.nginx.org -o name
+  register: _policy_crd_check
+  changed_when: false
+  failed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 1] Assert Policy CRD"
+  ansible.builtin.assert:
+    that: _policy_crd_check.rc == 0
+    fail_msg: >-
+      Policy CRD (policies.k8s.nginx.org) not found. Required for CORS in Method 2.
+      Upgrade the F5 chart, or set cors via server-snippets fallback.
+    success_msg: "✅ Policy CRD present"
+  tags: f5-nginx-migrate
+
+- name: "[Step 1] Validate Policy CRD supports spec.cors"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl explain policy.spec.cors
+  register: _cors_schema_check
+  changed_when: false
+  failed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 1] Assert Policy CRD has spec.cors"
+  ansible.builtin.assert:
+    that: _cors_schema_check.rc == 0
+    fail_msg: >-
+      Policy CRD does not expose spec.cors on this version. CORS-via-Policy
+      will not work — upgrade the chart or switch CORS to server-snippets.
+    success_msg: "✅ Policy.spec.cors available"
+  tags: f5-nginx-migrate
+
+
+# ── 2. Inventory (sources + adoptees) ────────────────────────────────────────
+- name: "[Step 2] SINGLE mode — fetch Ingress"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl get ingress {{ _mig_ingress_name }}
+    -n {{ _mig_namespace }} -o json
+  register: _single_ingress_raw
+  changed_when: false
+  when: not _mig_multi
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] SINGLE mode — write raw for classification"
+  ansible.builtin.copy:
+    content: "{{ '{\"items\": [' + _single_ingress_raw.stdout + ']}' }}"
+    dest: "/tmp/_f5_m2_raw_ingresses.json"
+    mode: '0600'
+  when: not _mig_multi
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] MULTI mode — fetch all Ingresses"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl get ingress -n {{ _mig_namespace }} -o json
+  register: _multi_ingress_raw
+  changed_when: false
+  when: _mig_multi
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] MULTI mode — write raw ingress list for classification"
+  ansible.builtin.copy:
+    content: "{{ _multi_ingress_raw.stdout }}"
+    dest: "/tmp/_f5_m2_raw_ingresses.json"
+    mode: '0600'
+  when: _mig_multi
+  tags: f5-nginx-migrate
+
+# Classify every ingress:
+#   - class == old_class                          -> role 'source' (translate)
+#   - class == new_class AND no migration label   -> role 'adoptee' (already F5,
+#       manually migrated — keep annotations verbatim, route them)
+#   - migration-method label present              -> OUR prior output: excluded
+#   - anything else                               -> excluded
+# Class is read from spec.ingressClassName OR the legacy
+# kubernetes.io/ingress.class annotation (Mutu client).
+- name: "[Step 2] Classify by class (source / adoptee)"
+  ansible.builtin.shell: |
+    python3 - << 'PYEOF'
+    import json
+
+    with open("/tmp/_f5_m2_raw_ingresses.json") as f:
+        data = json.load(f)
+
+    old_class = "{{ _mig_old_class }}"
+    new_class = "{{ _mig_new_class }}"
+    adopt     = "{{ _mig_adopt_migrated }}" == "True"
+
+    def get_ingress_class(ingress):
+        spec_class = ingress.get('spec', {}).get('ingressClassName', '')
+        if spec_class:
+            return spec_class
+        return ingress.get('metadata', {}).get('annotations', {}).get(
+            'kubernetes.io/ingress.class', ''
+        )
+
+    matched = []
+    for ing in data.get('items', []):
+        if ing.get('metadata', {}).get('name', '').endswith('-test'):
+            continue  # our own test-mode artifact (cleaned at cutover)
+        c = get_ingress_class(ing)
+        if c == old_class:
+            ing['_mig_role'] = 'source'
+            matched.append(ing)
+        elif adopt and c == new_class:
+            ing['_mig_role'] = 'adoptee'
+            matched.append(ing)
+    print(json.dumps(matched))
+    PYEOF
+  register: _classified_raw
+  changed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] Set classified ingress list"
+  ansible.builtin.set_fact:
+    _ingress_list: "{{ _classified_raw.stdout | from_json }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] Clean up temp raw file"
+  ansible.builtin.file:
+    path: "/tmp/_f5_m2_raw_ingresses.json"
+    state: absent
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] Assert Ingresses found"
+  ansible.builtin.assert:
+    that: _ingress_list | length > 0
+    fail_msg: "No Ingresses in '{{ _mig_namespace }}' with class '{{ _mig_old_class }}' (or adoptable '{{ _mig_new_class }}')."
+  tags: f5-nginx-migrate
+
+- name: "[Step 2] Display inventory"
+  ansible.builtin.debug:
+    msg: >-
+      Found {{ _ingress_list | length }}:
+      sources [{{ _ingress_list | selectattr('_mig_role', 'eq', 'source') | map(attribute='metadata.name') | list | join(', ') }}]
+      adoptees [{{ _ingress_list | selectattr('_mig_role', 'eq', 'adoptee') | map(attribute='metadata.name') | list | join(', ') }}]
+  tags: f5-nginx-migrate
+
+
+# ── 2b. Build Units + Directory structure ─────────────────────────────────────
+- name: "[Step 2b] Create directory structure"
+  ansible.builtin.file:
+    path: "{{ _mig_backup_path }}/{{ _mig_namespace }}/{{ item }}"
+    state: directory
+    mode: '0700'
+    owner: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+  loop:
+    - "backup"
+    - "logs"
+    - "tmp"
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Clean stale tmp files from prior runs"
+  ansible.builtin.shell: >
+    rm -f {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_units.json
+    {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_all_ingresses.json
+    {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_ingress_*.json
+    {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_conflict_check.json
+  changed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Write ingress list to tmp"
+  ansible.builtin.copy:
+    content: "{{ _ingress_list | to_json }}"
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_all_ingresses.json"
+    mode: '0600'
+  tags: f5-nginx-migrate
+
+# Unit model:
+#   plain      : 1 source, host(s) unique to it  -> one re-annotated Ingress
+#   mergeable  : >1 member on one host           -> master + minion per member
+#   validated  : 1 adoptee, unique host          -> untouched, validate only
+#   skipped    : no host in rules                -> flagged for manual handling
+# Multi-host members cannot merge (single-host rule) — plain/validated,
+# with a collision flag if any of their hosts is shared.
+- name: "[Step 2b] Write unit-builder script"
+  ansible.builtin.copy:
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_build_units.py"
+    mode: '0700'
+    content: |
+      import json, os
+
+      base = "{{ _mig_backup_path }}/{{ _mig_namespace }}"
+      use_mergeable = "{{ _mig_use_mergeable }}" == "True"
+      with open(os.path.join(base, 'tmp', '_all_ingresses.json')) as f:
+          ingress_list = json.load(f)
+
+      def hosts_of(ing):
+          hs = []
+          for rule in ing.get('spec', {}).get('rules', []):
+              h = rule.get('host', '')
+              if h and h not in hs:
+                  hs.append(h)
+          return hs
+
+      def tls_lookup(ing):
+          lut = {}
+          for tls in ing.get('spec', {}).get('tls', []):
+              for h in tls.get('hosts', []):
+                  lut[h] = tls.get('secretName', '')
+          return lut
+
+      def ctime(ing):
+          return ing.get('metadata', {}).get('creationTimestamp', '') or ''
+
+      ordered = sorted(ingress_list, key=ctime)
+      simple = {}
+      units = []
+
+      for ing in ordered:
+          name = ing['metadata']['name']
+          role = ing.get('_mig_role', 'source')
+          hs   = hosts_of(ing)
+          lut  = tls_lookup(ing)
+
+          if not hs:
+              units.append({
+                  'unit_type': 'skipped', 'primary_host': '(no-host)',
+                  'hosts': [], 'members': [{'name': name, 'role': role}],
+                  'tls_secret': '', 'tls_sources': [], 'multi_host': False,
+                  'reason': 'no host in spec.rules (default-backend style) — migrate manually',
+              })
+              continue
+
+          if len(hs) == 1:
+              h = hs[0]
+              grp = simple.setdefault(h, {'host': h, 'members': [], 'tls_entries': []})
+              grp['members'].append({'name': name, 'role': role})
+              if lut.get(h):
+                  grp['tls_entries'].append(
+                      {'ingress': name, 'secret': lut[h], 'role': role})
+          else:
+              units.append({
+                  'unit_type': 'validated' if role == 'adoptee' else 'plain',
+                  'primary_host': hs[0], 'hosts': hs,
+                  'members': [{'name': name, 'role': role}],
+                  'tls_secret': lut.get(hs[0], ''),
+                  'tls_sources': [{'ingress': name, 'secret': lut.get(h, ''), 'role': role}
+                                  for h in hs if lut.get(h)],
+                  'multi_host': True,
+              })
+
+      for h, grp in sorted(simple.items()):
+          members = grp['members']
+          if len(members) == 1:
+              ut = 'validated' if members[0]['role'] == 'adoptee' else 'plain'
+          else:
+              ut = 'mergeable' if use_mergeable else 'plain'
+          # TLS preference: adoptee entry wins (human-validated F5 state)
+          tls_secret = ''
+          for e in grp['tls_entries']:
+              if e['role'] == 'adoptee':
+                  tls_secret = e['secret']
+                  break
+          if not tls_secret and grp['tls_entries']:
+              tls_secret = grp['tls_entries'][0]['secret']
+          units.append({
+              'unit_type': ut, 'primary_host': h, 'hosts': [h],
+              'members': members, 'tls_secret': tls_secret,
+              'tls_sources': grp['tls_entries'], 'multi_host': False,
+          })
+
+      # collision flag: two units claiming the same host
+      seen = {}
+      for u in units:
+          label = u['members'][0]['name'] if u['members'] else '?'
+          for h in u['hosts']:
+              if h in seen:
+                  u.setdefault('host_collision', []).append(
+                      {'host': h, 'with': seen[h]})
+              else:
+                  seen[h] = label
+
+      print(json.dumps(units))
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Build migration units"
+  ansible.builtin.command: "python3 {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_build_units.py"
+  register: _units_raw
+  changed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Set units"
+  ansible.builtin.set_fact:
+    _units: "{{ _units_raw.stdout | from_json }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Write units.json to tmp"
+  ansible.builtin.copy:
+    content: "{{ _units | to_json }}"
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_units.json"
+    mode: '0600'
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Create generated/<host> directories"
+  ansible.builtin.file:
+    path: "{{ _mig_backup_path }}/{{ _mig_namespace }}/generated/{{ item.primary_host | regex_replace('[^a-zA-Z0-9]', '-') | lower }}"
+    state: directory
+    mode: '0700'
+    owner: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+  loop: "{{ _units | rejectattr('unit_type', 'in', ['skipped', 'validated']) | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Display units"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.primary_host }} — {{ item.unit_type | upper }} —
+      {{ item.members | map(attribute='name') | list | join(', ') }}
+      (roles: {{ item.members | map(attribute='role') | list | join(', ') }})
+      {{ '(multi-host)' if item.multi_host else '' }}
+  loop: "{{ _units }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Warn skipped units"
+  ansible.builtin.debug:
+    msg: "⏭️  SKIPPED — {{ item.members | map(attribute='name') | list | join(', ') }}: {{ item.reason }}"
+  loop: "{{ _units | selectattr('unit_type', 'eq', 'skipped') | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _units | selectattr('unit_type', 'eq', 'skipped') | list | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Warn host collisions"
+  ansible.builtin.debug:
+    msg: "🚨 HOST COLLISION — {{ item.primary_host }} shares host(s) with another unit (multi-host members cannot merge): {{ item.host_collision }}"
+  loop: "{{ _units }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: item.host_collision is defined
+  tags: f5-nginx-migrate
+
+- name: "[Step 2b] Warn TLS conflicts"
+  ansible.builtin.debug:
+    msg: "⚠️  TLS CONFLICT on {{ item.primary_host }} — adoptee/oldest wins: {{ item.tls_secret }} (sources: {{ item.tls_sources }})"
+  loop: "{{ _units }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: item.tls_sources | map(attribute='secret') | unique | list | length > 1
+  tags: f5-nginx-migrate
+
+
+# ── 3. Backup ─────────────────────────────────────────────────────────────────
+- name: "[Step 3] Backup Ingresses → backup/"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl get ingress {{ item.metadata.name }}
+    -n {{ _mig_namespace }} -o yaml
+    > {{ _mig_backup_path }}/{{ _mig_namespace }}/backup/{{ item.metadata.name }}-backup.yaml
+  loop: "{{ _ingress_list }}"
+  loop_control:
+    label: "{{ item.metadata.name }} ({{ item._mig_role }})"
+  changed_when: true
+  tags: f5-nginx-migrate
+
+- name: "[Step 3] Set 600 on backups"
+  ansible.builtin.file:
+    path: "{{ _mig_backup_path }}/{{ _mig_namespace }}/backup/{{ item.metadata.name }}-backup.yaml"
+    mode: '0600'
+  loop: "{{ _ingress_list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 3] Assert backups exist"
+  ansible.builtin.stat:
+    path: "{{ _mig_backup_path }}/{{ _mig_namespace }}/backup/{{ item.metadata.name }}-backup.yaml"
+  loop: "{{ _ingress_list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: _backup_stats
+  tags: f5-nginx-migrate
+
+- name: "[Step 3] Assert backups created"
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "Backup failed for {{ item.item.metadata.name }} — aborting."
+  loop: "{{ _backup_stats.results }}"
+  loop_control:
+    label: "{{ item.item.metadata.name }}"
+  tags: f5-nginx-migrate
+
+
+# ── 3b. Write source Ingress JSONs to tmp/ ────────────────────────────────────
+- name: "[Step 3b] Write Ingress JSONs"
+  ansible.builtin.copy:
+    content: "{{ item | to_json }}"
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_ingress_{{ item.metadata.name }}.json"
+    mode: '0600'
+  loop: "{{ _ingress_list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  tags: f5-nginx-migrate
+
+
+# ── 4. Translate / Adopt + Generate ───────────────────────────────────────────
+- name: "[Step 4] Write generator script to tmp/"
+  ansible.builtin.copy:
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_generate_unit.py"
+    mode: '0700'
+    content: |
+        import json, re, os, yaml
+
+        base_path = "{{ _mig_backup_path }}/{{ _mig_namespace }}"
+        tmp_path  = os.path.join(base_path, 'tmp')
+        gen_base  = os.path.join(base_path, 'generated')
+        namespace = "{{ _mig_namespace }}"
+        new_class = "{{ _mig_new_class }}"
+        test_mode = "{{ _mig_test_mode }}" == "True"
+        test_host = "{{ _mig_test_host }}"
+        cors_default = "{{ _mig_cors_default }}" == "True"
+        hsts_default = "{{ _mig_hsts_default }}" == "True"
+        unit_index = int(os.environ["UNIT_INDEX"])
+        suffix = "-test" if test_mode else ""   # F6: never clobber live adoptees
+
+        with open(os.path.join(tmp_path, '_units.json')) as f:
+            units = json.load(f)
+        unit = units[unit_index]
+
+        primary_host = unit['primary_host']
+        unit_type    = unit['unit_type']
+        members      = unit['members']
+        tls_secret   = unit['tls_secret']
+        unit_hosts   = unit['hosts']
+        multi_host   = unit.get('multi_host', False)
+
+        sanitized = re.sub(r'[^a-zA-Z0-9]', '-', primary_host).strip('-').lower()
+        gen_path  = os.path.join(gen_base, sanitized)
+
+        P = "nginx.ingress.kubernetes.io/"   # community prefix
+        O = "nginx.org/"                     # F5 prefix
+
+        # Annotations that configure the SERVER block — master-only in a
+        # mergeable set (minion-forbidden per official rules).
+        SERVER_LEVEL_F5 = {
+            O + 'redirect-to-https', O + 'ssl-redirect',
+            'ingress.kubernetes.io/ssl-redirect',
+            O + 'http-redirect-code',
+            O + 'hsts', O + 'hsts-max-age', O + 'hsts-include-subdomains',
+            O + 'hsts-behind-proxy',
+            O + 'server-tokens', O + 'server-snippets',
+            O + 'proxy-hide-headers', O + 'proxy-pass-headers',
+            O + 'listen-ports', O + 'listen-ports-ssl',
+            O + 'policies', O + 'app-root',
+        }
+        # Pseudo / inert keys seen in hand migrations — they are NOT real F5
+        # Ingress annotations and do nothing on either controller.
+        INERT_F5 = {
+            O + 'default-server': 'not an F5 Ingress annotation — inert; remove (default server is controller-level)',
+            O + 'enable-underscores-in-headers': 'no F5 annotation — set ConfigMap http-snippets: underscores_in_headers on;',
+            O + 'hsts-preload': 'no F5 annotation — preload is included automatically by nginx.org/hsts',
+        }
+        CORS_PSEUDO = {
+            O + 'enable-cors', O + 'cors-allow-origin', O + 'cors-allow-methods',
+            O + 'cors-allow-headers', O + 'cors-allow-credentials',
+            O + 'cors-max-age', O + 'cors-expose-headers',
+        }
+
+        # Metadata / machinery annotations never migrated onto generated objects
+        DROP_ALWAYS = {
+            'kubectl.kubernetes.io/last-applied-configuration',
+            'kubernetes.io/ingress.class',
+            O + 'mergeable-ingress-type',          # recomputed by us
+            'field.cattle.io/publicEndpoints',
+        }
+        DROP_PREFIXES = ('meta.helm.sh/', 'helm.sh/')
+
+        # ── Helpers ────────────────────────────────────────────────────────
+        def ann(ia, key, default=''):
+            if P + key in ia:
+                return ia[P + key]
+            if O + key in ia:
+                return ia[O + key]
+            return default
+
+        def ann_raw(ia, *keys):
+            for k in keys:
+                if k in ia:
+                    return ia[k]
+            return None   # None = absent (three-state support)
+
+        def is_true(v):
+            return str(v).strip().lower() in ('true', 'on', '1', 'yes')
+
+        def is_false(v):
+            return str(v).strip().lower() in ('false', 'off', '0', 'no')
+
+        def with_s(v):
+            v = str(v).strip()
+            if not v:
+                return ''
+            return v if re.search(r'[a-zA-Z]$', v) else v + 's'
+
+        def services_of(ing):
+            svcs = []
+            for rule in ing.get('spec', {}).get('rules', []):
+                for p in (rule.get('http', {}) or {}).get('paths', []):
+                    n = p.get('backend', {}).get('service', {}).get('name', '')
+                    if n and n not in svcs:
+                        svcs.append(n)
+            return svcs
+
+        def host_paths(ing, host):
+            out = []
+            for rule in ing.get('spec', {}).get('rules', []):
+                if rule.get('host', '') == host:
+                    out.extend((rule.get('http', {}) or {}).get('paths', []))
+            return out
+
+        def f5name(n):
+            return n if n.endswith('-f5') else n + '-f5'
+
+        # F7: deterministic per-host test mapping for multi-host units
+        host_map = {}
+        for i, h in enumerate(unit_hosts):
+            if test_mode:
+                host_map[h] = test_host if i == 0 else 't' + str(i) + '-' + test_host
+            else:
+                host_map[h] = h
+
+        def eff_host(h):
+            return host_map.get(h, test_host if test_mode else h)
+
+        def write_yaml(obj, fp):
+            with open(fp, 'w') as f:
+                yaml.safe_dump(obj, f, sort_keys=False, default_flow_style=False, width=4096)
+            os.chmod(fp, 0o600)
+
+        # ── Translation of a community-annotated SOURCE ────────────────────
+        # Returns server/location annotation dicts + cors + audit (F4: every
+        # annotation key gets an explicit disposition; nothing silent).
+        def translate(ing):
+            ia   = ing.get('metadata', {}).get('annotations', {}) or {}
+            name = ing['metadata']['name']
+            svcs = services_of(ing)
+            server, location = {}, {}
+            dropped, flagged, unsupported = {}, {}, {}
+            audit = {}
+
+            def mark(keys, disposition):
+                for k in keys:
+                    if k in ia:
+                        audit[k] = disposition
+
+            # timeouts (location)
+            for ck in ('proxy-connect-timeout', 'proxy-read-timeout', 'proxy-send-timeout'):
+                v = ann(ia, ck)
+                if v:
+                    location[O + ck] = with_s(v)
+                    mark([P + ck, O + ck], '-> ' + O + ck)
+
+            # buffering / body size (location)
+            if ann(ia, 'proxy-body-size'):
+                location[O + 'client-max-body-size'] = ann(ia, 'proxy-body-size')
+                mark([P + 'proxy-body-size'], '-> ' + O + 'client-max-body-size')
+            if ann(ia, 'client-body-buffer-size'):
+                location[O + 'client-body-buffer-size'] = ann(ia, 'client-body-buffer-size')
+                mark([P + 'client-body-buffer-size'], '-> ' + O + 'client-body-buffer-size')
+            if ann(ia, 'proxy-buffer-size'):
+                location[O + 'proxy-buffer-size'] = ann(ia, 'proxy-buffer-size')
+                mark([P + 'proxy-buffer-size'], '-> ' + O + 'proxy-buffer-size')
+            if ann_raw(ia, P + 'proxy-buffering', O + 'proxy-buffering') is not None:
+                location[O + 'proxy-buffering'] = 'True' if is_true(ann(ia, 'proxy-buffering')) else 'False'
+                mark([P + 'proxy-buffering'], '-> ' + O + 'proxy-buffering')
+            if ann(ia, 'proxy-buffers-number'):
+                num  = ann(ia, 'proxy-buffers-number')
+                size = ann(ia, 'proxy-buffer-size') or '4k'
+                location[O + 'proxy-buffers'] = num + ' ' + size
+                mark([P + 'proxy-buffers-number'], '-> ' + O + 'proxy-buffers (with buffer-size)')
+            if ann(ia, 'proxy-busy-buffers-size'):
+                location[O + 'proxy-busy-buffers-size'] = ann(ia, 'proxy-busy-buffers-size')
+                mark([P + 'proxy-busy-buffers-size'], '-> ' + O + 'proxy-busy-buffers-size')
+
+            # next-upstream (location)
+            if ann(ia, 'proxy-next-upstream'):
+                location[O + 'proxy-next-upstream'] = ann(ia, 'proxy-next-upstream')
+                mark([P + 'proxy-next-upstream'], '-> ' + O + 'proxy-next-upstream')
+            if ann(ia, 'proxy-next-upstream-timeout'):
+                location[O + 'proxy-next-upstream-timeout'] = with_s(ann(ia, 'proxy-next-upstream-timeout'))
+                mark([P + 'proxy-next-upstream-timeout'], '-> ' + O + 'proxy-next-upstream-timeout')
+            if ann(ia, 'proxy-next-upstream-tries'):
+                location[O + 'proxy-next-upstream-tries'] = ann(ia, 'proxy-next-upstream-tries')
+                mark([P + 'proxy-next-upstream-tries'], '-> ' + O + 'proxy-next-upstream-tries')
+
+            # load balancing (location)
+            if ann(ia, 'load-balance'):
+                location[O + 'lb-method'] = ann(ia, 'load-balance')
+                mark([P + 'load-balance'], '-> ' + O + 'lb-method')
+
+            # backend protocol (location)
+            bp = ann(ia, 'backend-protocol')
+            if bp:
+                if bp.upper() == 'HTTPS' and svcs:
+                    location[O + 'ssl-services'] = ",".join(svcs)
+                    mark([P + 'backend-protocol'], '-> ' + O + 'ssl-services')
+                elif bp.upper() in ('GRPC', 'GRPCS') and svcs:
+                    location[O + 'grpc-services'] = ",".join(svcs)
+                    mark([P + 'backend-protocol'], '-> ' + O + 'grpc-services')
+                elif bp.upper() == 'HTTP':
+                    mark([P + 'backend-protocol'], 'no-op (HTTP is the F5 default)')
+                else:
+                    flagged[P + 'backend-protocol'] = 'Unrecognised value: ' + bp
+                    mark([P + 'backend-protocol'], 'flagged')
+
+            # session affinity (location) — only when annotated
+            aff = ann(ia, 'affinity')
+            if aff.lower() == 'cookie':
+                cookie  = ann(ia, 'session-cookie-name') or 'route'
+                expires = ann(ia, 'session-cookie-expires') or ann(ia, 'session-cookie-max-age')
+                path    = ann(ia, 'session-cookie-path') or '/'
+                entries = []
+                for s in svcs:
+                    parts = ['serviceName=' + s, cookie]
+                    if expires:
+                        parts.append('expires=' + with_s(expires))
+                    parts.append('path=' + path)
+                    entries.append(" ".join(parts))
+                if entries:
+                    location[O + 'sticky-cookie-services'] = ";".join(entries)
+                mark([P + 'affinity', P + 'session-cookie-name',
+                      P + 'session-cookie-expires', P + 'session-cookie-max-age',
+                      P + 'session-cookie-path'],
+                     '-> nginx.com/sticky-cookie-services')
+                for extra in ('session-cookie-domain', 'session-cookie-samesite',
+                              'session-cookie-secure', 'session-cookie-change-on-failure',
+                              'session-cookie-conditional-samesite-none', 'affinity-mode'):
+                    if P + extra in ia:
+                        flagged[P + extra] = 'No sticky-cookie field for this option — verify behaviour'
+                        mark([P + extra], 'flagged')
+            elif aff:
+                flagged[P + 'affinity'] = 'Unsupported affinity type: ' + aff
+                mark([P + 'affinity'], 'flagged')
+
+            # rewrites (location) — F3: default case_insensitive (community
+            # use-regex compiles to case-insensitive ~* locations)
+            rewrite   = ann(ia, 'rewrite-target')
+            use_regex = is_true(ann(ia, 'use-regex'))
+            if rewrite:
+                if use_regex or '$' in rewrite:
+                    location[O + 'rewrite-target'] = rewrite
+                    location[O + 'path-regex'] = 'case_insensitive'
+                    mark([P + 'rewrite-target', P + 'use-regex'],
+                         '-> ' + O + 'rewrite-target + path-regex (case_insensitive)')
+                else:
+                    location[O + 'rewrites'] = ";".join(
+                        'serviceName=' + s + ' rewrite=' + rewrite for s in svcs)
+                    mark([P + 'rewrite-target'], '-> ' + O + 'rewrites')
+            elif use_regex:
+                location[O + 'path-regex'] = 'case_insensitive'
+                mark([P + 'use-regex'], '-> ' + O + 'path-regex (case_insensitive)')
+
+            # proxy-set-headers (location)
+            psh = []
+            if ann(ia, 'upstream-vhost'):
+                psh.append('Host: ' + ann(ia, 'upstream-vhost'))
+                mark([P + 'upstream-vhost'], '-> ' + O + 'proxy-set-headers (Host)')
+            if ann(ia, 'x-forwarded-prefix'):
+                psh.append('X-Forwarded-Prefix: ' + ann(ia, 'x-forwarded-prefix'))
+                mark([P + 'x-forwarded-prefix'], '-> ' + O + 'proxy-set-headers (X-Forwarded-Prefix)')
+            if psh:
+                location[O + 'proxy-set-headers'] = ",".join(psh)
+
+            # snippets
+            if ia.get(P + 'configuration-snippet'):
+                location[O + 'location-snippets'] = ia[P + 'configuration-snippet']
+                mark([P + 'configuration-snippet'], '-> ' + O + 'location-snippets')
+            if ia.get(P + 'server-snippet'):
+                server[O + 'server-snippets'] = ia[P + 'server-snippet']
+                mark([P + 'server-snippet'], '-> ' + O + 'server-snippets (master)')
+
+            # app-root (server)
+            if ann(ia, 'app-root'):
+                server[O + 'app-root'] = ann(ia, 'app-root')
+                mark([P + 'app-root'], '-> ' + O + 'app-root (master)')
+
+            # redirects (server) — F2: THREE-STATE. Explicit false MUST be
+            # emitted: F5's ConfigMap ssl-redirect defaults to True and the
+            # POC depends on false to avoid the ALB 301 loop.
+            force_raw = ann_raw(ia, P + 'force-ssl-redirect', O + 'redirect-to-https')
+            ssl_raw   = ann_raw(ia, P + 'ssl-redirect', O + 'ssl-redirect',
+                                'ingress.kubernetes.io/ssl-redirect')
+            if force_raw is not None and is_true(force_raw):
+                server[O + 'redirect-to-https'] = 'true'
+                server[O + 'http-redirect-code'] = '308'
+                mark([P + 'force-ssl-redirect', O + 'redirect-to-https'],
+                     '-> ' + O + 'redirect-to-https + http-redirect-code 308 (master)')
+                if ssl_raw is not None:
+                    mark([P + 'ssl-redirect', 'ingress.kubernetes.io/ssl-redirect'],
+                         'superseded by force-ssl-redirect')
+            elif ssl_raw is not None and is_true(ssl_raw):
+                server[O + 'ssl-redirect'] = 'true'
+                server[O + 'http-redirect-code'] = '301'
+                mark([P + 'ssl-redirect', 'ingress.kubernetes.io/ssl-redirect', O + 'ssl-redirect'],
+                     '-> ' + O + 'ssl-redirect true + http-redirect-code 301 (master)')
+            elif ((ssl_raw is not None and is_false(ssl_raw))
+                  or (force_raw is not None and is_false(force_raw))):
+                server[O + 'ssl-redirect'] = 'false'
+                mark([P + 'ssl-redirect', 'ingress.kubernetes.io/ssl-redirect',
+                      P + 'force-ssl-redirect', O + 'ssl-redirect', O + 'redirect-to-https'],
+                     '-> ' + O + 'ssl-redirect "false" (master — explicit, prevents ALB redirect loop)')
+
+            # HSTS (server) — native annotations
+            hsts_raw = ann_raw(ia, P + 'hsts', O + 'hsts')
+            hsts_on  = (hsts_raw is not None and is_true(hsts_raw))
+            if hsts_on:
+                server[O + 'hsts'] = 'true'
+                server[O + 'hsts-max-age'] = ann(ia, 'hsts-max-age') or '31536000'
+                if is_true(ann(ia, 'hsts-include-subdomains')):
+                    server[O + 'hsts-include-subdomains'] = 'true'
+                mark([P + 'hsts', P + 'hsts-max-age', P + 'hsts-include-subdomains',
+                      O + 'hsts', O + 'hsts-max-age', O + 'hsts-include-subdomains'],
+                     '-> ' + O + 'hsts* (master)')
+                if P + 'hsts-preload' in ia or O + 'hsts-preload' in ia:
+                    mark([P + 'hsts-preload', O + 'hsts-preload'],
+                         'no-op (no F5 annotation; preload is included automatically by nginx.org/hsts)')
+            elif hsts_raw is not None and is_false(hsts_raw):
+                mark([P + 'hsts'], 'no-op (F5 hsts default is off)')
+
+            # CORS values (Policy generated by caller)
+            cors_raw = ann_raw(ia, P + 'enable-cors', O + 'enable-cors')
+            cors_on  = (cors_raw is not None and is_true(cors_raw))
+            cors = None
+            cors_keys = [P + 'enable-cors', P + 'cors-allow-origin', P + 'cors-allow-methods',
+                         P + 'cors-allow-headers', P + 'cors-allow-credentials',
+                         P + 'cors-max-age', P + 'cors-expose-headers',
+                         O + 'enable-cors', O + 'cors-allow-origin', O + 'cors-allow-methods',
+                         O + 'cors-allow-headers', O + 'cors-allow-credentials',
+                         O + 'cors-max-age', O + 'cors-expose-headers']
+            if cors_on:
+                headers = [h.strip() for h in
+                           (ann(ia, 'cors-allow-headers')
+                            or 'Authorization,Content-Type,Accept,X-Requested-With').split(',')
+                           if h.strip() and h.strip().lower() != 'origin']
+                methods = [m.strip() for m in
+                           (ann(ia, 'cors-allow-methods')
+                            or 'GET,POST,PUT,DELETE,PATCH,OPTIONS').split(',') if m.strip()]
+                cors = {
+                    'origin':  ann(ia, 'cors-allow-origin') or 'https://' + primary_host,
+                    'methods': methods,
+                    'headers': headers,
+                    'creds':   ann(ia, 'cors-allow-credentials') or 'true',
+                    'maxage':  ann(ia, 'cors-max-age') or '86400',
+                }
+                mark(cors_keys, '-> CORS Policy CRD (nginx.org/cors-* are pseudo-annotations: no native F5 CORS)')
+            elif cors_raw is not None and is_false(cors_raw):
+                mark(cors_keys, 'no-op (enable-cors explicitly false)')
+
+            # DROPPED (machinery / ALB-level)
+            for k in list(ia):
+                if k in DROP_ALWAYS or k.startswith(DROP_PREFIXES):
+                    dropped[k] = '(metadata/machinery — not migrated)'
+                    mark([k], 'dropped (metadata/machinery)')
+            for k in (P + 'certificate-arn', P + 'http2-push-preload',
+                      'ingress.kubernetes.io/secure-backends'):
+                if k in ia:
+                    dropped[k] = ia[k]
+                    mark([k], 'dropped (no F5 equivalent / handled at ALB)')
+
+            # FLAGGED (manual / ConfigMap / Policy)
+            if ann(ia, 'keep-alive-timeout'):
+                flagged[P + 'keep-alive-timeout'] = ("duration belongs in ConfigMap key "
+                    "'keepalive-timeout' (nginx.org/keepalive is a connection COUNT)")
+                mark([P + 'keep-alive-timeout'], 'flagged -> ConfigMap keepalive-timeout')
+            if ia.get(P + 'custom-http-errors') or ia.get(P + 'default-backend'):
+                flagged['custom-http-errors/default-backend'] = 'No Ingress annotation — handle manually'
+                mark([P + 'custom-http-errors', P + 'default-backend'], 'flagged')
+            for k in ('whitelist-source-range', 'denylist-source-range'):
+                if ann(ia, k):
+                    flagged[P + k] = 'Map to accessControl Policy + nginx.org/policies (manual in v1.1)'
+                    mark([P + k], 'flagged -> accessControl Policy')
+            for k in ('enable-modsecurity', 'enable-owasp-core-rules',
+                      'modsecurity-snippet', 'modsecurity-transaction-id'):
+                if ia.get(P + k):
+                    flagged[P + k] = 'WAF — configure F5 WAF Policy manually'
+                    mark([P + k], 'flagged (WAF)')
+            for k in ('auth-type', 'auth-secret', 'auth-realm', 'auth-secret-type',
+                      'auth-tls-secret', 'auth-tls-verify-client', 'auth-tls-verify-depth',
+                      'auth-tls-error-page', 'auth-tls-pass-certificate-to-upstream'):
+                if ia.get(P + k):
+                    flagged[P + k] = 'Auth — map to basicAuth/ingressMTLS Policy manually'
+                    mark([P + k], 'flagged (auth)')
+            for k in ('mirror-target', 'mirror-request-body', 'mirror-host'):
+                if ia.get(P + k):
+                    flagged[P + k] = 'Request mirroring — server/location-snippets manually'
+                    mark([P + k], 'flagged (mirroring)')
+            if ia.get(P + 'enable-opentelemetry'):
+                flagged[P + 'enable-opentelemetry'] = 'OTel is global ConfigMap-only in F5 (otel-trace-in-http)'
+                mark([P + 'enable-opentelemetry', P + 'opentelemetry-trust-incoming-span'], 'flagged (OTel)')
+
+            # Mixed-annotation sources (partially migrated by hand): route any
+            # remaining GENUINE F5 annotations verbatim; flag inert pseudo keys.
+            for k, v in ia.items():
+                if k in audit:
+                    continue
+                if k in INERT_F5:
+                    flagged[k] = INERT_F5[k]
+                    audit[k] = 'flagged (inert pseudo-annotation): ' + INERT_F5[k]
+                elif k in SERVER_LEVEL_F5:
+                    server[k] = v
+                    audit[k] = 'routed verbatim -> master (already-F5 server-level annotation)'
+                elif k.startswith(O) or k.startswith('nginx.com/'):
+                    location[k] = v
+                    audit[k] = 'routed verbatim -> minion (already-F5 annotation)'
+
+            # F4: anything still unaccounted -> UNSUPPORTED (loud, never silent)
+            for k in ia:
+                if k not in audit:
+                    unsupported[k] = ia[k]
+                    audit[k] = 'UNSUPPORTED — manual review required'
+
+            return {
+                'name': name, 'role': 'source', 'services': svcs,
+                'server': server, 'location': location, 'cors': cors,
+                'dropped': dropped, 'flagged': flagged, 'unsupported': unsupported,
+                'audit': audit,
+                'helm_managed': any(k.startswith('meta.helm.sh/') for k in ia),
+                'helm_release': ia.get('meta.helm.sh/release-name', ''),
+            }
+
+        # ── Adoption of an already-migrated F5 ADOPTEE ─────────────────────
+        # No translation: nginx.org/* annotations are kept VERBATIM, only
+        # ROUTED to master (server-level) or its own minion (everything else).
+        def adopt(ing):
+            ia   = ing.get('metadata', {}).get('annotations', {}) or {}
+            name = ing['metadata']['name']
+            server, location = {}, {}
+            dropped, flagged, unsupported = {}, {}, {}
+            audit = {}
+            # Pseudo-CORS intent (nginx.org/cors-* do not exist in F5) -> Policy
+            cors = None
+            if is_true(ia.get(O + 'enable-cors', '')):
+                headers = [h.strip() for h in
+                           (ia.get(O + 'cors-allow-headers', '')
+                            or 'Authorization,Content-Type,Accept,X-Requested-With').split(',')
+                           if h.strip() and h.strip().lower() != 'origin']
+                methods = [m.strip() for m in
+                           (ia.get(O + 'cors-allow-methods', '')
+                            or 'GET,POST,PUT,DELETE,PATCH,OPTIONS').split(',') if m.strip()]
+                cors = {
+                    'origin':  ia.get(O + 'cors-allow-origin', '') or 'https://' + primary_host,
+                    'methods': methods,
+                    'headers': headers,
+                    'creds':   ia.get(O + 'cors-allow-credentials', '') or 'true',
+                    'maxage':  ia.get(O + 'cors-max-age', '') or '86400',
+                }
+            for k, v in ia.items():
+                if k in DROP_ALWAYS or k.startswith(DROP_PREFIXES):
+                    dropped[k] = '(metadata/machinery — not migrated)'
+                    audit[k] = 'dropped (metadata/machinery)'
+                elif k in CORS_PSEUDO:
+                    audit[k] = ('-> CORS Policy CRD (pseudo-annotation; no native F5 CORS)'
+                                if cors else
+                                'no-op (CORS pseudo-annotation; enable-cors not true)')
+                elif k in INERT_F5:
+                    flagged[k] = INERT_F5[k]
+                    audit[k] = 'flagged (inert pseudo-annotation): ' + INERT_F5[k]
+                elif k in SERVER_LEVEL_F5:
+                    server[k] = v
+                    audit[k] = 'routed verbatim -> master (server-level)'
+                elif k.startswith(O) or k.startswith('nginx.com/'):
+                    location[k] = v
+                    audit[k] = 'routed verbatim -> own minion (location-level)'
+                elif k.startswith(P):
+                    flagged[k] = 'Community annotation left on an F5 ingress — was inert; review intent'
+                    audit[k] = 'flagged (community annotation on adoptee — inert on F5)'
+                else:
+                    unsupported[k] = v
+                    audit[k] = 'UNSUPPORTED — manual review required'
+            return {
+                'name': name, 'role': 'adoptee', 'services': services_of(ing),
+                'server': server, 'location': location, 'cors': cors,
+                'dropped': dropped, 'flagged': flagged, 'unsupported': unsupported,
+                'audit': audit,
+                'helm_managed': any(k.startswith('meta.helm.sh/') for k in ia),
+                'helm_release': ia.get('meta.helm.sh/release-name', ''),
+            }
+
+        # ── CORS Policy writer (official 5.4.x schema) ─────────────────────
+        def write_cors_policy(cors, policy_name):
+            pol = {
+                'apiVersion': 'k8s.nginx.org/v1',
+                'kind': 'Policy',
+                'metadata': {
+                    'name': policy_name, 'namespace': namespace,
+                },
+                'spec': {'cors': {
+                    'allowOrigin': [cors['origin']],
+                    'allowMethods': cors['methods'],
+                    'allowHeaders': cors['headers'],
+                    'allowCredentials': str(cors['creds']).lower() == 'true',
+                    'maxAge': int(str(cors['maxage'])) if str(cors['maxage']).isdigit() else cors['maxage'],
+                }},
+            }
+            fp = os.path.join(gen_path, policy_name + '.yaml')
+            write_yaml(pol, fp)
+            return {'policy_name': policy_name, 'filepath': fp}
+
+        # ── Load members ───────────────────────────────────────────────────
+        sources_json = {}
+        for m in members:
+            with open(os.path.join(tmp_path, '_ingress_' + m['name'] + '.json')) as f:
+                sources_json[m['name']] = json.load(f)
+
+        result = {
+            'primary_host': primary_host, 'unit_type': unit_type,
+            'effective_host': eff_host(primary_host) if unit_type not in ('validated', 'skipped') else primary_host,
+            'members': members,
+            'source_ingress_names': [m['name'] for m in members],
+            'plain_files': [], 'master_files': [], 'minion_files': [], 'policy_files': [],
+            'unsupported': {}, 'dropped': {}, 'flagged': {}, 'conflicts': [],
+            'audit': {}, 'validation': [],
+            'cutover_plan': {'delete': [], 'convert_to_minion': []},
+            'helm_managed': False, 'helm_releases': [],
+        }
+
+        # ── SKIPPED unit ───────────────────────────────────────────────────
+        if unit_type == 'skipped':
+            result['flagged']['unit'] = unit.get('reason', 'skipped')
+            print(json.dumps(result))
+            raise SystemExit(0)
+
+        # ── VALIDATED unit (unique-host adoptee — untouched) ───────────────
+        if unit_type == 'validated':
+            ing = sources_json[members[0]['name']]
+            ia  = ing.get('metadata', {}).get('annotations', {}) or {}
+            checks = []
+            cls = ing.get('spec', {}).get('ingressClassName', '')
+            checks.append(('ingressClassName == ' + new_class,
+                           'PASS' if cls == new_class else 'WARN (is: ' + cls + ')'))
+            checks.append(('spec.tls present',
+                           'PASS' if ing.get('spec', {}).get('tls') else 'WARN (terminates on defaultTLS fallback cert)'))
+            leftovers = [k for k in ia if k.startswith(P)]
+            checks.append(('no inert community annotations',
+                           'PASS' if not leftovers else 'WARN: ' + ", ".join(leftovers)))
+            result['validation'] = [{'check': c, 'result': r} for c, r in checks]
+            result['audit'][members[0]['name']] = {k: 'left as-is (validated unit)' for k in ia}
+            print(json.dumps(result))
+            raise SystemExit(0)
+
+        os.makedirs(gen_path, exist_ok=True)
+
+        # ── Process members ────────────────────────────────────────────────
+        processed = []
+        for m in members:
+            ing = sources_json[m['name']]
+            t = adopt(ing) if m['role'] == 'adoptee' else translate(ing)
+            processed.append((ing, t))
+            result['unsupported'].update(t['unsupported'])
+            result['dropped'].update(t['dropped'])
+            result['flagged'].update(t['flagged'])
+            result['audit'][t['name']] = t['audit']
+            if t['helm_managed']:
+                result['helm_managed'] = True
+                if t['helm_release'] and t['helm_release'] not in result['helm_releases']:
+                    result['helm_releases'].append(t['helm_release'])
+
+        src_ts     = [t for _, t in processed if t['role'] == 'source']
+        adoptee_ts = [t for _, t in processed if t['role'] == 'adoptee']
+
+        # =================================================================
+        # PLAIN unit (single source; may be multi-host)
+        # =================================================================
+        if unit_type == 'plain':
+            src, t = processed[0]
+            ing_name = f5name(t['name']) + suffix
+            anns = {}
+            anns.update(t['server'])
+            anns.update(t['location'])
+
+            cors_obj = t['cors']
+            if cors_obj is None and cors_default:
+                cors_obj = {'origin': 'https://' + primary_host,
+                            'methods': ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+                            'headers': ['Authorization', 'Content-Type', 'Accept', 'X-Requested-With'],
+                            'creds': 'true', 'maxage': '86400'}
+                result['flagged']['CORS default'] = 'No CORS configured — default CORS Policy generated'
+            if cors_obj:
+                pol_name = f5name(t['name']) + '-cors' + suffix
+                pol = write_cors_policy(cors_obj, pol_name)
+                result['policy_files'].append(pol)
+                existing = anns.get(O + 'policies', '')
+                anns[O + 'policies'] = (existing + ',' + pol_name) if existing else pol_name
+            if hsts_default and (O + 'hsts') not in anns:
+                anns[O + 'hsts'] = 'true'
+                anns[O + 'hsts-max-age'] = '31536000'
+                anns[O + 'hsts-include-subdomains'] = 'true'
+                result['flagged']['HSTS default'] = 'No HSTS configured — defaults added'
+
+            rules = []
+            for rule in src.get('spec', {}).get('rules', []):
+                r = json.loads(json.dumps(rule))
+                if r.get('host'):
+                    r['host'] = eff_host(r['host'])
+                rules.append(r)
+
+            ing = {
+                'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
+                'metadata': {'name': ing_name, 'namespace': namespace,
+                             'annotations': anns},
+                'spec': {'ingressClassName': new_class, 'rules': rules},
+            }
+            # F7: per-host TLS structure preserved from the source
+            src_tls = src.get('spec', {}).get('tls', [])
+            if src_tls:
+                ing['spec']['tls'] = [
+                    {'hosts': [eff_host(h) for h in e.get('hosts', [])],
+                     'secretName': e.get('secretName', '')} for e in src_tls]
+            elif tls_secret:
+                ing['spec']['tls'] = [{'hosts': [eff_host(h) for h in unit_hosts],
+                                       'secretName': tls_secret}]
+            fp = os.path.join(gen_path, ing_name + '.yaml')
+            write_yaml(ing, fp)
+            result['plain_files'].append({'name': ing_name, 'filepath': fp})
+            result['cutover_plan']['delete'].append(t['name'])
+            if multi_host and test_mode:
+                result['flagged']['multi-host test mapping'] = host_map
+
+        # =================================================================
+        # MERGEABLE unit (master + one minion per member)
+        # =================================================================
+        else:
+            # Master server config: translated sources oldest-first, then
+            # adoptee OVERRIDES (human-validated F5 state wins). All
+            # disagreements flagged.
+            master_server = {}
+            for t in src_ts:
+                for k, v in t['server'].items():
+                    if k not in master_server:
+                        master_server[k] = v
+                    elif master_server[k] != v:
+                        result['conflicts'].append(
+                            {'annotation': k, 'kept': master_server[k],
+                             'ignored_from': t['name'], 'ignored_value': v,
+                             'rule': 'oldest source wins'})
+            for t in adoptee_ts:
+                for k, v in t['server'].items():
+                    if k in master_server and master_server[k] != v:
+                        result['conflicts'].append(
+                            {'annotation': k, 'kept': v,
+                             'overridden': master_server[k],
+                             'rule': 'adoptee wins (' + t['name'] + ')'})
+                    master_server[k] = v
+
+            master_name = sanitized + '-master-f5' + suffix
+            m_anns = {O + 'mergeable-ingress-type': 'master'}
+            m_anns.update(master_server)
+
+            # HSTS default: if no member configured HSTS, add defaults (master)
+            if hsts_default and (O + 'hsts') not in master_server:
+                master_server[O + 'hsts'] = 'true'
+                master_server[O + 'hsts-max-age'] = '31536000'
+                master_server[O + 'hsts-include-subdomains'] = 'true'
+                result['flagged']['HSTS default'] = 'No member configured HSTS — default HSTS added to master'
+                m_anns.update({O + 'hsts': 'true', O + 'hsts-max-age': '31536000',
+                               O + 'hsts-include-subdomains': 'true'})
+
+            # CORS Policy: adoptee intent wins, then oldest source, then default
+            cors_src = (next((t for t in adoptee_ts if t['cors']), None)
+                        or next((t for t in src_ts if t['cors']), None))
+            cors_obj = cors_src['cors'] if cors_src else None
+            if cors_obj is None and cors_default:
+                cors_obj = {'origin': 'https://' + primary_host,
+                            'methods': ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+                            'headers': ['Authorization', 'Content-Type', 'Accept', 'X-Requested-With'],
+                            'creds': 'true', 'maxage': '86400'}
+                result['flagged']['CORS default'] = 'No member configured CORS — default CORS Policy generated for the host'
+            if cors_obj:
+                pol_name = sanitized + '-cors' + suffix
+                pol = write_cors_policy(cors_obj, pol_name)
+                result['policy_files'].append(pol)
+                existing = m_anns.get(O + 'policies', '')
+                m_anns[O + 'policies'] = (existing + ',' + pol_name) if existing else pol_name
+                for t in (src_ts + adoptee_ts):
+                    if t['cors'] and (cors_src is None or t is not cors_src) and t['cors'] != cors_obj:
+                        result['conflicts'].append(
+                            {'annotation': 'cors', 'ignored_from': t['name'],
+                             'rule': 'one shared CORS policy per host'})
+
+            master = {
+                'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
+                'metadata': {'name': master_name, 'namespace': namespace,
+                             'annotations': m_anns},
+                'spec': {'ingressClassName': new_class,
+                         'rules': [{'host': eff_host(primary_host)}]},
+            }
+            if tls_secret:
+                master['spec']['tls'] = [{'hosts': [eff_host(primary_host)],
+                                          'secretName': tls_secret}]
+            else:
+                result['flagged']['master TLS'] = ('No TLS secret found on any member — host would '
+                    'terminate on the defaultTLS fallback cert. Review before cutover.')
+            fp = os.path.join(gen_path, master_name + '.yaml')
+            write_yaml(master, fp)
+            result['master_files'].append({'name': master_name, 'filepath': fp})
+
+            for ing, t in processed:
+                m_paths = host_paths(ing, primary_host)
+                if not m_paths:
+                    result['flagged'][t['name'] + ' (no paths)'] = ('Member has no paths for '
+                        'this host — contributed server-level config only; no minion emitted')
+                    continue
+                minion_name = f5name(t['name']) + suffix
+                mi_anns = {O + 'mergeable-ingress-type': 'minion'}
+                mi_anns.update(t['location'])
+                minion = {
+                    'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
+                    'metadata': {'name': minion_name, 'namespace': namespace,
+                                 'annotations': mi_anns},
+                    'spec': {'ingressClassName': new_class,
+                             'rules': [{'host': eff_host(primary_host),
+                                        'http': {'paths': m_paths}}]},
+                }
+                fp = os.path.join(gen_path, minion_name + '.yaml')
+                write_yaml(minion, fp)
+                result['minion_files'].append({'name': minion_name, 'filepath': fp})
+                if t['role'] == 'adoptee':
+                    result['cutover_plan']['convert_to_minion'].append(t['name'])
+                else:
+                    result['cutover_plan']['delete'].append(t['name'])
+
+        print(json.dumps(result))
+  tags: f5-nginx-migrate
+
+# Looped per unit. Static script (nothing through the shell arg-splitter);
+# the per-iteration index is passed via the UNIT_INDEX environment variable.
+- name: "[Step 4] Generate Ingress / master+minion / Policy YAMLs"
+  ansible.builtin.command: "python3 {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_generate_unit.py"
+  environment:
+    UNIT_INDEX: "{{ unit_index }}"
+  loop: "{{ _units }}"
+  loop_control:
+    index_var: unit_index
+    label: "{{ item.primary_host }} ({{ item.unit_type }})"
+  register: _parse_results
+  changed_when: true
+  tags: f5-nginx-migrate
+
+- name: "[Step 4] Collect parse results"
+  ansible.builtin.set_fact:
+    _all_parse_results: >-
+      {{ _parse_results.results | map(attribute='stdout') | map('from_json') | list }}
+  tags: f5-nginx-migrate
+
+- name: "[Step 4] Collect generated names"
+  ansible.builtin.set_fact:
+    _mig_generated_ing: >-
+      {{ _all_parse_results | map(attribute='plain_files') | flatten | map(attribute='name') | list }}
+    _mig_generated_master: >-
+      {{ _all_parse_results | map(attribute='master_files') | flatten | map(attribute='name') | list }}
+    _mig_generated_minion: >-
+      {{ _all_parse_results | map(attribute='minion_files') | flatten | map(attribute='name') | list }}
+    _mig_generated_pol: >-
+      {{ _all_parse_results | map(attribute='policy_files') | flatten | map(attribute='policy_name') | list }}
+  tags: f5-nginx-migrate
+
+
+# ── 4b. Reports ───────────────────────────────────────────────────────────────
+- name: "[Step 4b] Unsupported annotations"
+  ansible.builtin.debug:
+    msg: ["⚠️  UNSUPPORTED on {{ item.primary_host }}:", "{{ item.unsupported | to_nice_yaml }}"]
+  loop: "{{ _all_parse_results | selectattr('unsupported', 'ne', {}) | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _all_parse_results | selectattr('unsupported', 'ne', {}) | list | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 4b] Dropped annotations"
+  ansible.builtin.debug:
+    msg: ["🗑️  DROPPED on {{ item.primary_host }}:", "{{ item.dropped | to_nice_yaml }}"]
+  loop: "{{ _all_parse_results | selectattr('dropped', 'ne', {}) | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _all_parse_results | selectattr('dropped', 'ne', {}) | list | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 4b] Flagged annotations"
+  ansible.builtin.debug:
+    msg: ["🔧 FLAGGED on {{ item.primary_host }}:", "{{ item.flagged | to_nice_yaml }}"]
+  loop: "{{ _all_parse_results | selectattr('flagged', 'ne', {}) | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _all_parse_results | selectattr('flagged', 'ne', {}) | list | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 4b] Server-level conflicts (mergeable)"
+  ansible.builtin.debug:
+    msg: ["🚨 SERVER-LEVEL CONFLICTS on {{ item.primary_host }}:", "{{ item.conflicts | to_nice_yaml }}"]
+  loop: "{{ _all_parse_results | selectattr('conflicts', 'ne', []) | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _all_parse_results | selectattr('conflicts', 'ne', []) | list | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 4b] All clear ✅"
+  ansible.builtin.debug:
+    msg: "No unsupported/flagged annotations ✅"
+  when:
+    - _all_parse_results | selectattr('unsupported', 'ne', {}) | list | length == 0
+    - _all_parse_results | selectattr('flagged', 'ne', {}) | list | length == 0
+  tags: f5-nginx-migrate
+
+
+# ── 4c. FULL annotation audit (F4 — nothing silent) ──────────────────────────
+- name: "[Step 4c] Annotation audit — every annotation, its disposition"
+  ansible.builtin.debug:
+    msg: ["📋 AUDIT — {{ item.primary_host }} ({{ item.unit_type }}):", "{{ item.audit | to_nice_yaml }}"]
+  loop: "{{ _all_parse_results }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 4c] Validation results (untouched adoptees)"
+  ansible.builtin.debug:
+    msg: ["✔️  VALIDATED (left as-is) — {{ item.source_ingress_names | join(', ') }}:", "{{ item.validation | to_nice_yaml }}"]
+  loop: "{{ _all_parse_results | selectattr('unit_type', 'eq', 'validated') | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _all_parse_results | selectattr('unit_type', 'eq', 'validated') | list | length > 0
+  tags: f5-nginx-migrate
+
+
+# ── 4d. Conflict Detection ────────────────────────────────────────────────────
+- name: "[Step 4d] Write conflict check data"
+  ansible.builtin.copy:
+    content: |
+      {
+        "generated": {{ (_mig_generated_ing + _mig_generated_master + _mig_generated_minion) | to_json }},
+        "members": {{ _all_parse_results | map(attribute='source_ingress_names') | flatten | list | to_json }},
+        "hosts_to_check": {{ _all_parse_results | rejectattr('unit_type', 'in', ['validated', 'skipped']) | map(attribute='effective_host') | list | to_json }}
+      }
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_conflict_check.json"
+    mode: '0600'
+  tags: f5-nginx-migrate
+
+- name: "[Step 4d] Write conflict-check script"
+  ansible.builtin.copy:
+    dest: "{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_check_conflicts.py"
+    mode: '0700'
+    content: |
+      import subprocess, json
+
+      with open("{{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_conflict_check.json") as f:
+          data = json.load(f)
+      generated = set(data['generated'])
+      members   = set(data['members'])   # F5: unit members own the host legitimately
+      hosts     = set(data['hosts_to_check'])
+      conflicts = []
+
+      try:
+          r = subprocess.run(['kubectl', 'get', 'ingress', '-A', '-o', 'json'],
+                             capture_output=True, text=True)
+          for ing in json.loads(r.stdout).get('items', []):
+              n  = ing['metadata']['name']
+              ns = ing['metadata']['namespace']
+              if n in generated or n in members:
+                  continue
+              for rule in ing.get('spec', {}).get('rules', []):
+                  if rule.get('host', '') in hosts:
+                      conflicts.append({'kind': 'Ingress', 'name': n,
+                                        'namespace': ns, 'host': rule.get('host')})
+      except Exception:
+          pass
+
+      try:
+          r = subprocess.run(['kubectl', 'get', 'virtualserver', '-A', '-o', 'json'],
+                             capture_output=True, text=True)
+          for vs in json.loads(r.stdout).get('items', []):
+              h = vs.get('spec', {}).get('host', '')
+              if h in hosts:
+                  conflicts.append({'kind': 'VirtualServer',
+                                    'name': vs['metadata']['name'],
+                                    'namespace': vs['metadata']['namespace'], 'host': h})
+      except Exception:
+          pass
+
+      print(json.dumps({'conflicts': conflicts}))
+  tags: f5-nginx-migrate
+
+- name: "[Step 4d] Check conflicts"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    python3 {{ _mig_backup_path }}/{{ _mig_namespace }}/tmp/_check_conflicts.py
+  register: _conflict_raw
+  changed_when: false
+  tags: f5-nginx-migrate
+
+- name: "[Step 4d] Set conflict fact"
+  ansible.builtin.set_fact:
+    _host_conflicts: "{{ (_conflict_raw.stdout | from_json).conflicts }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 4d] Warn conflicts"
+  ansible.builtin.debug:
+    msg: ["🚨 HOST OWNERSHIP CONFLICTS (foreign objects, not unit members):", "{{ _host_conflicts | to_nice_yaml }}"]
+  when: _host_conflicts | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 4d] Abort on conflict (real-host apply only)"
+  ansible.builtin.fail:
+    msg: "Host already owned by foreign object(s): {{ _host_conflicts | map(attribute='name') | list | join(', ') }}"
+  when:
+    - _host_conflicts | length > 0
+    - not _mig_dry_run
+    - not _mig_test_mode
+  tags: f5-nginx-migrate
+
+- name: "[Step 4d] No conflicts ✅"
+  ansible.builtin.debug:
+    msg: "No host ownership conflicts ✅"
+  when: _host_conflicts | length == 0
+  tags: f5-nginx-migrate
+
+
+# ── 5. Summary ────────────────────────────────────────────────────────────────
+- name: "[Step 5] Summary header"
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - " F5 NGINX Migration — METHOD 2 — v1.2"
+      - " Mode      : {{ 'TEST' if _mig_test_mode else 'NORMAL' }}{{ ' / DRY-RUN' if _mig_dry_run else '' }}"
+      - " Plain Ing : {{ _mig_generated_ing | length }}"
+      - " Masters   : {{ _mig_generated_master | length }}"
+      - " Minions   : {{ _mig_generated_minion | length }}"
+      - " Policies  : {{ _mig_generated_pol | length }}"
+      - " Validated : {{ _all_parse_results | selectattr('unit_type', 'eq', 'validated') | list | length }} (untouched)"
+      - " Skipped   : {{ _all_parse_results | selectattr('unit_type', 'eq', 'skipped') | list | length }}"
+      - " Saved     : {{ _mig_backup_path }}/{{ _mig_namespace }}/generated/"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  tags: f5-nginx-migrate
+
+- name: "[Step 5] Per-unit summary"
+  ansible.builtin.debug:
+    msg:
+      - "  host     : {{ item.primary_host }}  (apply host: {{ item.effective_host }})"
+      - "  type     : {{ item.unit_type }}"
+      - "  members  : {{ item.members | map(attribute='name') | list | join(', ') }} ({{ item.members | map(attribute='role') | list | join(', ') }})"
+      - "  plain    : {{ item.plain_files | map(attribute='name') | list | join(', ') | default('-', true) }}"
+      - "  master   : {{ item.master_files | map(attribute='name') | list | join(', ') | default('-', true) }}"
+      - "  minions  : {{ item.minion_files | map(attribute='name') | list | join(', ') | default('-', true) }}"
+      - "  policies : {{ item.policy_files | map(attribute='policy_name') | list | join(', ') | default('-', true) }}"
+      - "  cutover  : delete [{{ item.cutover_plan.delete | join(', ') }}] / convert-to-minion [{{ item.cutover_plan.convert_to_minion | join(', ') }}]"
+  loop: "{{ _all_parse_results }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  tags: f5-nginx-migrate
+
+
+# ── 5b. Helm Warning ──────────────────────────────────────────────────────────
+- name: "[Step 5b] Helm warning"
+  ansible.builtin.debug:
+    msg:
+      - "⚠️  HELM-MANAGED source on {{ item.primary_host }} ({{ item.helm_releases | join(', ') }})"
+      - "  The generated objects are standalone; the source is still Helm-owned."
+      - "  Update Helm values (ingressClass/customAnnotations) for permanent cutover."
+  loop: "{{ _all_parse_results | selectattr('helm_managed') | list }}"
+  loop_control:
+    label: "{{ item.primary_host }}"
+  when: _all_parse_results | selectattr('helm_managed') | list | length > 0
+  tags: f5-nginx-migrate
+
+
+# ── 5c. Apply ─────────────────────────────────────────────────────────────────
+- name: "[Step 5c] DRY RUN — nothing applied"
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — generated {{ _mig_generated_pol | length }} Policy / {{ _mig_generated_master | length }} master / {{ _mig_generated_minion | length }} minion / {{ _mig_generated_ing | length }} plain Ingress, NOT applied."
+      - "Review : {{ _mig_backup_path }}/{{ _mig_namespace }}/generated/"
+      - "Apply  : re-run with dry_run: false (test_mode: true keeps test_host + -test names)."
+  when: _mig_dry_run
+  tags: f5-nginx-migrate
+
+- name: "[Step 5c] Apply Policies first"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl apply -f {{ item.filepath }}
+  loop: "{{ _all_parse_results | map(attribute='policy_files') | flatten }}"
+  loop_control:
+    label: "{{ item.policy_name }}"
+  when:
+    - not _mig_dry_run
+    - _mig_generated_pol | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 5c] Apply masters"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl apply -f {{ item.filepath }}
+  loop: "{{ _all_parse_results | map(attribute='master_files') | flatten }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - not _mig_dry_run
+    - _mig_generated_master | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 5c] Apply minions + plain Ingresses"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl apply -f {{ item.filepath }}
+  loop: >-
+    {{ (_all_parse_results | map(attribute='minion_files') | flatten)
+       + (_all_parse_results | map(attribute='plain_files') | flatten) }}
+  loop_control:
+    label: "{{ item.name }}"
+  register: _ing_apply_results
+  when: not _mig_dry_run
+  tags: f5-nginx-migrate
+
+
+# ── 6. Validate ───────────────────────────────────────────────────────────────
+# Ingress has no .status.state; the controller signals via events
+# (AddedOrUpdated vs Rejected). F9: poll with retries; an empty result after
+# retries is a WARNING — never a silent pass.
+- name: "[Step 6a] Poll controller event per generated Ingress"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: |
+    PATH=$PATH:/usr/local/bin
+    kubectl get events -n {{ _mig_namespace }} \
+      --field-selector involvedObject.name={{ item }},involvedObject.kind=Ingress \
+      --sort-by=.lastTimestamp \
+      -o jsonpath='{range .items[-1:]}{.reason}:{.message}{end}'
+  loop: "{{ _mig_generated_master + _mig_generated_minion + _mig_generated_ing }}"
+  loop_control:
+    label: "{{ item }}"
+  register: _ing_event_results
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 10
+  until: _ing_event_results.stdout is search('AddedOrUpdated|Rejected')
+  ignore_errors: true
+  when: not _mig_dry_run
+  tags: f5-nginx-migrate
+
+- name: "[Step 6a] Evaluate acceptance"
+  ansible.builtin.set_fact:
+    _ing_rejected: >-
+      {{ _ing_event_results.results | default([])
+         | selectattr('stdout', 'defined')
+         | selectattr('stdout', 'search', '^Rejected')
+         | map(attribute='item') | list }}
+    _ing_no_event: >-
+      {{ _ing_event_results.results | default([])
+         | selectattr('stdout', 'defined')
+         | rejectattr('stdout', 'search', 'AddedOrUpdated|Rejected')
+         | map(attribute='item') | list }}
+  when: not _mig_dry_run
+  tags: f5-nginx-migrate
+
+- name: "[Step 6a] Show event status"
+  ansible.builtin.debug:
+    msg: "{{ item.item }} → {{ item.stdout | default('(no event)') }}"
+  loop: "{{ _ing_event_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not _mig_dry_run
+  tags: f5-nginx-migrate
+
+- name: "[Step 6a] Warn on missing events"
+  ansible.builtin.debug:
+    msg: "⚠️  NO controller event after retries for: {{ _ing_no_event | join(', ') }} — verify manually (kubectl describe ing); events may have expired or the controller may be slow."
+  when:
+    - not _mig_dry_run
+    - _ing_no_event | default([]) | length > 0
+  tags: f5-nginx-migrate
+
+- name: "[Step 6a] Assert no rejections"
+  ansible.builtin.assert:
+    that: _ing_rejected | length == 0
+    fail_msg: "❌ Controller REJECTED: {{ _ing_rejected | join(', ') }}"
+    success_msg: "✅ No rejections from the controller"
+  when: not _mig_dry_run
+  register: _validate_assert
+  ignore_errors: "{{ _mig_auto_rollback }}"
+  tags: f5-nginx-migrate
+
+- name: "[Step 6a] Mark rollback needed"
+  ansible.builtin.set_fact:
+    _mig_rollback_needed: true
+  when:
+    - not _mig_dry_run
+    - _validate_assert is defined
+    - _validate_assert is failed
+  tags: f5-nginx-migrate
+
+
+# ── 6r. Cleanup on validation failure (test-apply rollback) ──────────────────
+- name: "[Step 6r] ROLLBACK — delete minions + plain"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl delete ingress {{ item }} -n {{ _mig_namespace }} --ignore-not-found
+  loop: "{{ _mig_generated_minion + _mig_generated_ing }}"
+  loop_control:
+    label: "{{ item }}"
+  when: _mig_rollback_needed | bool
+  tags: f5-nginx-migrate
+
+- name: "[Step 6r] ROLLBACK — delete masters"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl delete ingress {{ item }} -n {{ _mig_namespace }} --ignore-not-found
+  loop: "{{ _mig_generated_master }}"
+  loop_control:
+    label: "{{ item }}"
+  when: _mig_rollback_needed | bool
+  tags: f5-nginx-migrate
+
+- name: "[Step 6r] ROLLBACK — delete CORS policies"
+  become: true
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.shell: >
+    PATH=$PATH:/usr/local/bin
+    kubectl delete policy {{ item }} -n {{ _mig_namespace }} --ignore-not-found
+  loop: "{{ _mig_generated_pol }}"
+  loop_control:
+    label: "{{ item }}"
+  when: _mig_rollback_needed | bool
+  tags: f5-nginx-migrate
+
+- name: "[Step 6r] Fail after rollback"
+  ansible.builtin.fail:
+    msg: "Validation failed; test-applied resources rolled back. Review events above."
+  when: _mig_rollback_needed | bool
+  tags: f5-nginx-migrate
+
+
+# =============================================================================
+# DEFERRED to v2 (cutover_plan already computed per unit):
+#   - Step 6c  curl path tests via F5 NodePort (Host header per route)
+#   - Step 6d  F5 controller log fetch + reject/error scan -> logs/
+#   - Step 7b  atomic switch: delete cutover_plan.delete sources, apply
+#              convert_to_minion adoptees as minions, re-apply real-host
+#              objects (no -test suffix)
+# =============================================================================
