@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uid-write-verify
+  namespace: poc-f5-new
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+  containers:
+  - name: shell
+    image: busybox
+    command: ["sh", "-c"]
+    args:
+    - |
+      echo "=== Running as UID $(id -u), GID $(id -g) ==="
+      echo "=== Existing files (should see fake-old-nginx's write) ==="
+      ls -la /mnt/config/fmc/
+      echo "=== Testing UID 101 read ==="
+      cat /mnt/config/fmc/fhmc.conf > /dev/null && echo "READ ✅" || echo "READ ❌"
+      echo "=== Testing UID 101 write ==="
+      echo "# UID 101 write test $(date -Iseconds)" > /mnt/config/fmc/uid101-write-test.txt \
+        && echo "WRITE ✅" || echo "WRITE ❌"
+      echo "=== Files after write attempt ==="
+      ls -la /mnt/config/fmc/
+      sleep 60
+    volumeMounts:
+    - name: config
+      mountPath: /mnt/config
+  volumes:
+  - name: config
+    persistentVolumeClaim:
+      claimName: poc-f5-config-pvc
+
+
+---
+kubectl apply -f 01c-uid-write-verify.yaml
+kubectl -n poc-f5-new wait --for=condition=Ready pod/uid-write-verify --timeout=60s
+kubectl -n poc-f5-new logs uid-write-verify
+
+=== Running as UID 101, GID 101 ===
+=== Existing files (should see fake-old-nginx's write) ===
+-rw-r--r-- 1 101 101 329 Jul 9 08:00 fhmc.conf
+=== Testing UID 101 read ===
+READ ✅
+=== Testing UID 101 write ===
+WRITE ✅
+=== Files after write attempt ===
+-rw-r--r-- 1 101 101 329 Jul 9 08:00 fhmc.conf
+-rw-r--r-- 1 101 101  49 Jul 9 XX:XX uid101-write-test.txt
+
+kubectl -n poc-old-nginx exec deploy/fake-old-nginx -- ls -la /etc/nginx/custom/fmc/
+# Should see uid101-write-test.txt too
+
+# Delete the verify pod
+kubectl -n poc-f5-new delete pod uid-write-verify
+
+# Clean up test file (from either side works — both write to same EFS)
+kubectl -n poc-old-nginx exec deploy/fake-old-nginx -- rm /etc/nginx/custom/fmc/uid101-write-test.txt
