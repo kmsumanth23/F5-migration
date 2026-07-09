@@ -1,0 +1,488 @@
+---
+
+# ── 0. Variable Defaults ──────────────────────────────────────────────────────
+- name: Set F5 NGINX default variables
+  ansible.builtin.set_fact:
+    _f5_namespace:         "{{ f5_nginx_item.namespace }}"
+    _f5_release_name:      "{{ f5_nginx_item.release_name }}"
+    _f5_ingress_class:     "{{ f5_nginx_item.ingress_class }}"
+    _f5_image_version:     "{{ f5_nginx_item.image_version }}"
+    _f5_chart_version:     "{{ f5_nginx_item.chart_version }}"
+    _f5_path:              "{{ f5_nginx_item.path }}"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # POC — PVC + Static PV HARDCODED IN PLAYBOOK
+    # ══════════════════════════════════════════════════════════════════════════
+    # These values are hardcoded here (not read from tools.yaml / f5_nginx_item)
+    # so this POC can run without requiring edits to the shared vars file.
+    # For production, migrate these back to f5_nginx_item.pvc.* structure and
+    # remove this block.
+    #
+    # POC scenario: two-namespace Freedom simulation on hxun cluster
+    #   - EFS filesystem : fs-0987d8789220dec69
+    #   - Access point   : fsap-0f7d7b3fe44cc9fcb (shared across both PVs)
+    #   - Old-nginx side : poc-old-nginx / poc-old-config-pv+pvc (already created)
+    #   - F5 new side    : poc-f5-new   / poc-f5-config-pv+pvc  (created here)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # PVC config
+    _f5_pvc_enabled:       true
+    _f5_pvc_name:          "poc-f5-config-pvc"
+    _f5_pvc_mount_path:    "/etc/nginx/custom"
+    _f5_pvc_storage_class: ""          # empty = static binding (no dynamic provisioning)
+    _f5_pvc_storage_size:  "1Gi"
+    _f5_pvc_access_mode:   "ReadWriteMany"
+
+    # Static PV config — reuses existing EFS access point
+    _f5_static_pv_enabled: true
+    _f5_static_pv_name:    "poc-f5-config-pv"
+    _f5_static_pv_driver:  "efs.csi.aws.com"
+    _f5_static_pv_handle:  "fs-0987d8789220dec69::fsap-0f7d7b3fe44cc9fcb"
+  tags: f5-nginx 
+
+
+# ── 1. Namespace ──────────────────────────────────────────────────────────────
+
+- name: Create F5 NGINX namespace
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ _f5_namespace }}"
+  tags: f5-nginx
+
+
+# ── 2. Default TLS Secret (Health Check SNI Fallback) ─────────────────────────
+
+- name: Check if default TLS secret already exists
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ f5_default_cert_name }}"
+    namespace: "{{ _f5_namespace }}"
+  register: existing_default_cert
+  tags: f5-nginx
+
+- name: Generate self-signed default TLS certificate (health-check fallback)
+  ansible.builtin.command: >
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048
+    -keyout /tmp/f5-default.key
+    -out /tmp/f5-default.crt
+    -subj "/CN=f5-nginx-default/O=HCLNow"
+  when: existing_default_cert.resources | length == 0
+  changed_when: true
+  tags: f5-nginx
+
+- name: Read generated cert content
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - /tmp/f5-default.crt
+    - /tmp/f5-default.key
+  register: _cert_files
+  when: existing_default_cert.resources | length == 0
+  tags: f5-nginx
+
+- name: Create default TLS secret in cluster
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: kubernetes.io/tls
+      metadata:
+        name: "{{ f5_default_cert_name }}"
+        namespace: "{{ _f5_namespace }}"
+        labels:
+          purpose: f5-nginx-health-check-fallback
+      data:
+        tls.crt: "{{ _cert_files.results[0].content }}"
+        tls.key: "{{ _cert_files.results[1].content }}"
+  when: existing_default_cert.resources | length == 0
+  tags: f5-nginx
+
+- name: Clean up temporary cert files from disk
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/f5-default.crt
+    - /tmp/f5-default.key
+  when: existing_default_cert.resources | length == 0
+  tags: f5-nginx
+
+
+# ── 3. Download and Prepare Chart from GCP ────────────────────────────────────
+
+- name: Create F5 NGINX local directory
+  ansible.builtin.file:
+    path: "{{ _f5_path }}"
+    state: directory
+  tags: f5-nginx
+
+- name: Set the imagerepo json fact
+  ansible.builtin.set_fact:
+    imgrepo_jsn: "{{lookup('file','{{ data_private_dir }}/hclsw-imagerepo.json')}}"
+  delegate_to: localhost
+  tags: f5-nginx
+
+- name: Download the F5 NGINX helm chart from bucket
+  google.cloud.gcp_storage_object:
+    action: download
+    bucket: gss-bucket-image-repo
+    src: "repo/downloads/f5-ngnix/nginx-ingress-{{ _f5_chart_version }}.tgz"
+    dest: "{{ _f5_path }}/nginx-ingress-{{ _f5_chart_version }}.tgz"
+    project: "{{ gss_image_bucket_project }}"
+    auth_kind: serviceaccount
+    service_account_contents: "{{ imgrepo_jsn }}"
+  tags: f5-nginx
+
+- name: Unzip the F5 NGINX chart
+  ansible.builtin.unarchive:
+    src: "{{ _f5_path }}/nginx-ingress-{{ _f5_chart_version }}.tgz"
+    dest: "{{ _f5_path }}"
+    remote_src: yes
+  tags: f5-nginx
+
+
+# ── 3b. Optional PVC — Custom Config Volume ───────────────────────────────────
+
+# ── 3b.1. Static PV (optional) — reuse existing CSI volume handle ────────────
+# When pvc.static_pv.enabled = true, create a static PV pointing at a specific
+# existing CSI volume handle (e.g. an existing EFS access point). This lets F5
+# mount the same underlying storage that another controller was using, without
+# any file copy step. Requires storage_class to match on PV and PVC (or both
+# empty). The `Freedom` client uses this pattern.
+
+- name: "[Static PV] Assert required fields when static_pv is enabled"
+  ansible.builtin.assert:
+    that:
+      - _f5_static_pv_name | length > 0
+      - _f5_static_pv_handle | length > 0
+      - _f5_static_pv_driver | length > 0
+    fail_msg: >
+      When pvc.static_pv.enabled = true, you must provide:
+        - pvc.static_pv.pv_name
+        - pvc.static_pv.volume_handle (e.g. fs-XXX::fsap-YYY for EFS)
+        - pvc.static_pv.csi_driver (default: efs.csi.aws.com)
+  when: _f5_pvc_enabled and _f5_static_pv_enabled
+  tags: f5-nginx
+
+- name: "[Static PV] Check if static PV already exists"
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ _f5_static_pv_name }}"
+  register: _existing_static_pv
+  when: _f5_pvc_enabled and _f5_static_pv_enabled
+  tags: f5-nginx
+
+- name: "[Static PV] Create static PV pointing at existing CSI volume handle"
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ _f5_static_pv_name }}"
+        labels:
+          app.kubernetes.io/instance: "{{ _f5_release_name }}"
+          purpose: f5-nginx-static-config
+      spec:
+        accessModes:
+          - "{{ _f5_pvc_access_mode }}"
+        capacity:
+          storage: "{{ _f5_pvc_storage_size }}"
+        csi:
+          driver: "{{ _f5_static_pv_driver }}"
+          volumeHandle: "{{ _f5_static_pv_handle }}"
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: "{{ _f5_pvc_storage_class }}"
+        volumeMode: Filesystem
+        claimRef:
+          namespace: "{{ _f5_namespace }}"
+          name: "{{ _f5_pvc_name }}"
+  when:
+    - _f5_pvc_enabled
+    - _f5_static_pv_enabled
+    - _existing_static_pv.resources | length == 0
+  tags: f5-nginx
+
+- name: "[Static PV] Skip static PV creation — already exists (idempotent)"
+  ansible.builtin.debug:
+    msg: "Static PV '{{ _f5_static_pv_name }}' already exists — skipping creation."
+  when:
+    - _f5_pvc_enabled
+    - _f5_static_pv_enabled
+    - _existing_static_pv.resources | length > 0
+  tags: f5-nginx
+
+- name: "[Static PV] Skipping static PV — not enabled for this install"
+  ansible.builtin.debug:
+    msg: "Static PV not requested (pvc.static_pv.enabled = false) — using dynamic provisioning."
+  when: _f5_pvc_enabled and not _f5_static_pv_enabled
+  tags: f5-nginx
+
+
+# ── 3b.2. PVC creation ───────────────────────────────────────────────────────
+# When static_pv is enabled, PVC binds explicitly to the static PV via volumeName.
+# When static_pv is disabled, PVC triggers dynamic provisioning via storage_class.
+# In both cases, storageClassName must match on PV and PVC (or both be empty).
+
+- name: "[PVC] Check if custom config PVC already exists"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ _f5_pvc_name }}"
+    namespace: "{{ _f5_namespace }}"
+  register: _existing_pvc
+  when: _f5_pvc_enabled
+  tags: f5-nginx
+
+- name: "[PVC] Create custom config PVC in F5 namespace (dynamic mode)"
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ _f5_pvc_name }}"
+        namespace: "{{ _f5_namespace }}"
+        labels:
+          app.kubernetes.io/instance: "{{ _f5_release_name }}"
+          purpose: f5-nginx-custom-config
+      spec:
+        accessModes:
+          - "{{ _f5_pvc_access_mode }}"
+        storageClassName: "{{ _f5_pvc_storage_class }}"
+        resources:
+          requests:
+            storage: "{{ _f5_pvc_storage_size }}"
+  when:
+    - _f5_pvc_enabled
+    - not _f5_static_pv_enabled
+    - _existing_pvc.resources | length == 0
+  tags: f5-nginx
+
+- name: "[PVC] Create custom config PVC in F5 namespace (static PV mode)"
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ _f5_pvc_name }}"
+        namespace: "{{ _f5_namespace }}"
+        labels:
+          app.kubernetes.io/instance: "{{ _f5_release_name }}"
+          purpose: f5-nginx-static-config
+      spec:
+        accessModes:
+          - "{{ _f5_pvc_access_mode }}"
+        storageClassName: "{{ _f5_pvc_storage_class }}"
+        volumeName: "{{ _f5_static_pv_name }}"
+        resources:
+          requests:
+            storage: "{{ _f5_pvc_storage_size }}"
+  when:
+    - _f5_pvc_enabled
+    - _f5_static_pv_enabled
+    - _existing_pvc.resources | length == 0
+  tags: f5-nginx
+
+- name: "[PVC] Confirm PVC is Bound before proceeding"
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ _f5_pvc_name }}"
+    namespace: "{{ _f5_namespace }}"
+  register: _pvc_status
+  retries: 10
+  delay: 10
+  until: _pvc_status.resources | length > 0 and
+         _pvc_status.resources[0].status.phase == 'Bound'
+  when: _f5_pvc_enabled
+  tags: f5-nginx
+
+- name: "[PVC] Assert PVC is Bound"
+  ansible.builtin.assert:
+    that: _pvc_status.resources[0].status.phase == 'Bound'
+    fail_msg: "PVC '{{ _f5_pvc_name }}' did not reach Bound state — check StorageClass '{{ _f5_pvc_storage_class }}' is available."
+    success_msg: "PVC '{{ _f5_pvc_name }}' is Bound ✅ — will be mounted at {{ _f5_pvc_mount_path }}"
+  when: _f5_pvc_enabled
+  tags: f5-nginx
+
+- name: "[PVC] Skipping PVC creation — not enabled for this install"
+  ansible.builtin.debug:
+    msg: "PVC not requested (f5_nginx_item.pvc.enabled = false) — skipping."
+  when: not _f5_pvc_enabled
+  tags: f5-nginx
+
+
+# ── 4. Build Helm Values ──────────────────────────────────────────────────────
+
+- name: Compose F5 NGINX Helm values
+  become_method: su
+  become_exe: sudo su -
+  ansible.builtin.set_fact:
+    _f5_helm_values:
+      controller:
+        image:
+          registry: "{{ tools_image_registry }}"
+          repository: "{{ f5_nginx_image_repository }}"
+          tag: "{{ _f5_image_version }}"
+          pullPolicy: "Always"
+        imagePullSecrets:
+          - name: "{{ image_pull_secret }}"
+        ingressClass:
+          name: "{{ _f5_ingress_class }}"
+        ingressClassResource:
+          name: "{{ _f5_ingress_class }}"
+          controllerName: "f5.com/nginx-ingress"
+        enableCustomResources: true
+        enableSnippets: true
+        defaultTLS:
+          secret: "{{ _f5_namespace }}/{{ f5_default_cert_name }}"
+        config:
+          entries:
+            underscores-in-headers: "true"
+            set-real-ip-from: "{{ f5_set_real_ip_from }}"
+            real-ip-header: "X-Forwarded-For"
+            real-ip-recursive: "True"
+        resources:
+          requests:
+            cpu: "{{ f5_cpu_request }}"
+            memory: "{{ f5_memory_request }}"
+        service:
+          create: true
+          type: NodePort
+          externalTrafficPolicy: Cluster
+          httpPort:
+            enable: true
+            port: 80
+          httpsPort:
+            enable: true
+            port: 443
+        volumes: "{{ [{'name': 'nginx-custom-config', 'persistentVolumeClaim': {'claimName': _f5_pvc_name}}] if _f5_pvc_enabled else [] }}"
+        volumeMounts: "{{ [{'name': 'nginx-custom-config', 'mountPath': _f5_pvc_mount_path, 'readOnly': false}] if _f5_pvc_enabled else [] }}"
+  tags: f5-nginx
+
+
+# ── 5. Install / Upgrade F5 NGINX via Local Helm Path ─────────────────────────
+
+- name: Install or upgrade F5 NGINX Ingress Controller
+  become: yes
+  become_user: root
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.helm:
+    name: "{{ _f5_release_name }}"
+    chart_ref: "{{ _f5_path }}/nginx-ingress"
+    release_namespace: "{{ _f5_namespace }}"
+    create_namespace: false
+    values: "{{ _f5_helm_values }}"
+    values_files: "{{ [f5_values_file] if f5_values_file is defined else [] }}"
+    wait: true
+    timeout: "300s"
+    state: "{{ 'present' }}"
+  register: f5_helm_result
+  tags: f5-nginx
+
+- name: Show Helm deployment result
+  ansible.builtin.debug:
+    var: f5_helm_result
+  when: f5_helm_result is defined
+  tags: f5-nginx
+
+
+# ── 6. Verify Controller is Running ───────────────────────────────────────────
+
+- name: Wait for F5 NGINX controller pod(s) to be Ready
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ _f5_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ _f5_release_name }}"
+  register: f5_pods
+  retries: 20
+  delay: 15
+  until: >
+    f5_pods.resources | length > 0 and
+    (f5_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length) ==
+    (f5_pods.resources | length)
+  tags: f5-nginx
+
+- name: Assert at least one F5 controller pod is running
+  ansible.builtin.assert:
+    that:
+      - f5_pods.resources | length > 0
+      - f5_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+    fail_msg: "F5 NGINX controller pods did not reach Running state."
+    success_msg: "F5 NGINX controller is running ({{ f5_pods.resources | length }} pod(s))."
+  tags: f5-nginx
+
+
+# ── 7. Verify IngressClass was Registered ─────────────────────────────────────
+
+- name: Confirm IngressClass '{{ _f5_ingress_class }}' exists in cluster
+  become_method: su
+  become_exe: sudo su -
+  kubernetes.core.k8s_info:
+    api_version: networking.k8s.io/v1
+    kind: IngressClass
+    name: "{{ _f5_ingress_class }}"
+  register: ingress_class_check
+  retries: 5
+  delay: 10
+  until: ingress_class_check.resources | length > 0
+  tags: f5-nginx
+
+- name: Assert IngressClass is registered
+  ansible.builtin.assert:
+    that: ingress_class_check.resources | length > 0
+    fail_msg: "IngressClass '{{ _f5_ingress_class }}' was not found after install."
+    success_msg: "IngressClass '{{ _f5_ingress_class }}' confirmed in cluster."
+  tags: f5-nginx
+
+
+# ── 8. Final Summary ─────────────────────────────────────────────────────────
+
+- name: Installation complete — final summary
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - " F5 NGINX Ingress Controller — Install Complete"
+      - "============================================================"
+      - "  Namespace             : {{ _f5_namespace }}"
+      - "  Release               : {{ _f5_release_name }}"
+      - "  Chart Version         : {{ f5_nginx_item.chart_version }}"
+      - "  IngressClass          : {{ _f5_ingress_class }}"
+      - "  Default TLS Secret    : {{ _f5_namespace }}/{{ f5_default_cert_name }}"
+      - "  PVC Enabled           : {{ _f5_pvc_enabled }}"
+      - "  PVC Mode              : {{ 'static PV (reuses existing volume)' if _f5_static_pv_enabled else ('dynamic (' + _f5_pvc_storage_class + ')' if _f5_pvc_enabled else 'N/A') }}"
+      - "  Static PV Name        : {{ _f5_static_pv_name if _f5_static_pv_enabled else 'N/A' }}"
+      - "  Static Volume Handle  : {{ _f5_static_pv_handle if _f5_static_pv_enabled else 'N/A' }}"
+      - "============================================================"
+      - "============================================================"
+  tags: f5-nginx 
