@@ -70,3 +70,197 @@ kubectl -n poc-f5-new exec $F5_POD -- md5sum /etc/nginx/custom/fmc/fhmc.conf
 
 # 3. No CSI mount errors in pod events
 kubectl -n poc-f5-new describe pod $F5_POD | grep -A5 Events
+
+
+Excellent — Phase 1.5 and Phase 3 both green in one shot. This is a substantial milestone. Let me break down what you just proved before we move to Phase 4.
+
+---
+
+## What Phase 1.5 Proved (UID 101 verify)
+
+```
+UID 101 running as pod user:
+  READ  ✅ — can read files owned by UID 101 (the seed)
+  WRITE ✅ — can write new files to the shared EFS
+  CROSS-VISIBLE ✅ — new file appeared instantly on fake-old-nginx side
+```
+
+The write test was actually a bonus proof point. F5 in production only needs read access to `fhmc.conf`-style includes, but seeing that writes work confirms:
+- EFS access point permissions (`755` + `Uid=101,Gid=101`) are correct
+- NFS lock semantics aren't blocking anything
+- File visibility is bidirectional and near-instant across the two namespaces
+
+---
+
+## What Phase 3 Proved (F5 install)
+
+```
+F5 POC controller: f5-nginx-poc-nginx-ingress-controller-7dbdbb78d-pn4r6
+Status: Running  1/1  no restarts
+```
+
+This confirms:
+- Install automation v4 with `static_pv.enabled: true` executed cleanly
+- The static PV creation task ran (either created new or detected existing from Phase 1b — either way, correct)
+- The PVC bound to the static PV correctly
+- F5 pod mounted `/etc/nginx/custom` from the shared EFS access point
+- Controller passed its own health checks and reached Running state
+
+If the mount had failed, the pod would still be `ContainerCreating` with events showing CSI errors. It's Running, so the mount is solid.
+
+---
+
+## Quick Confirmation Checks Before Phase 4
+
+Just to be thorough, please run these three quick checks so we know Phase 3 is not just "pod running" but actually "F5 sees the shared EFS data":
+
+```bash
+# 1. F5 pod actually mounted the PVC at the right path
+F5_POD=$(kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+kubectl -n poc-f5-new exec $F5_POD -- ls -la /etc/nginx/custom/fmc/
+
+# 2. F5 hash of the file matches reference (27c61417ae9f8eea8476bf3b5665c101)
+kubectl -n poc-f5-new exec $F5_POD -- md5sum /etc/nginx/custom/fmc/fhmc.conf
+
+# 3. No CSI mount errors in pod events
+kubectl -n poc-f5-new describe pod $F5_POD | grep -A5 Events
+```
+
+Expected: file present, hash matches reference from Phase 1a, no errors.
+
+---
+
+## Phase 4 Setup — Prove F5 Actually Uses the File at Runtime
+
+Assuming the three checks pass, next step is Phase 4. This is where we prove F5 doesn't just mount the file — it actually reads it and applies the directives from `fhmc.conf` when serving traffic.
+
+**Save this as `04-test-workload.yaml`:**
+
+```yaml
+# Test backend — plain nginx pod that returns 200 on any path
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-backend
+  namespace: poc-f5-new
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: test-backend}}
+  template:
+    metadata: {labels: {app: test-backend}}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports: [{containerPort: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-backend
+  namespace: poc-f5-new
+spec:
+  selector: {app: test-backend}
+  ports: [{port: 80, targetPort: 80}]
+---
+# Community-style source Ingress with configuration-snippet that includes fhmc.conf
+# This is what a Freedom-style Ingress looks like — we'll migrate it to F5 next
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: poc-test-source
+  namespace: poc-f5-new
+  annotations:
+    kubernetes.io/ingress.class: nginx-poc-source
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      include /etc/nginx/custom/fmc/fhmc.conf;
+spec:
+  ingressClassName: nginx-poc-source
+  rules:
+  - host: poc-test.hxun.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: test-backend
+            port: {number: 80}
+```
+
+Apply it:
+
+```bash
+kubectl apply -f 04-test-workload.yaml
+kubectl -n poc-f5-new wait --for=condition=Available deploy/test-backend --timeout=60s
+```
+
+**Then run the migration automation** (v8) to convert this source Ingress into an F5 VS. Use these `migration_item` values:
+
+```yaml
+migration_item:
+  namespace: poc-f5-new
+  ingress_name: poc-test-source
+  old_ingress_class: nginx-poc-source
+  new_ingress_class: nginx-f5-poc
+  f5_namespace: poc-f5-new
+  f5_release_name: f5-nginx-poc
+  backup_path: /apps/hxun/prod/utils/f5-poc-migration
+  test_mode: true
+  test_host: vs-test.poc-test.hxun.local
+  atomic_switch: false
+  dry_run: false
+  session_affinity_mode: global
+  multi: false
+```
+
+**Validate F5 sees the include with no errors:**
+
+```bash
+# No include errors in F5 logs
+kubectl -n poc-f5-new logs -l app.kubernetes.io/instance=f5-nginx-poc --tail=100 | grep -iE "error|warn|include|fhmc"
+
+# VS state Valid
+kubectl -n poc-f5-new get virtualserver
+```
+
+**Then port-forward and verify the include is actually applied to responses:**
+
+```bash
+# Get F5 NodePort svc
+F5_POC_SVC=$(kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+kubectl -n poc-f5-new port-forward $F5_POC_SVC 8443:443 &
+
+# Test 1 — all three POC markers should appear
+curl -sk -I -H "Host: vs-test.poc-test.hxun.local" https://localhost:8443/
+
+# Expected headers:
+#   X-POC-Marker: hxun-static-pv-poc-v1
+#   X-POC-File-Source: efs-access-point
+#   X-POC-Written-By: fake-old-nginx    ← this is the key one
+#                                       ← proves F5 is reading files written by "old NGINX"
+
+# Test 2 — rewrite from fhmc.conf must fire
+curl -sk -I -H "Host: vs-test.poc-test.hxun.local" https://localhost:8443/poc-test/old-path
+# Expected: HTTP/1.1 301 Moved Permanently
+#           Location: /poc-test/new-path
+```
+
+**Success gate for Phase 4:**
+- All three `X-POC-*` headers present in response
+- Rewrite fires with 301 + correct Location header
+- No include-related errors in F5 logs
+
+If all three markers appear on the response, we've proven the complete chain end-to-end:
+
+```
+fake-old-nginx writes → EFS access point stores → F5 pod mounts → 
+F5 reads at reload → configuration-snippet include fires → 
+directives from fhmc.conf apply to traffic → response headers set
+```
+
+That's the exact Freedom scenario proven top to bottom.
+
+---
+
+Share the output of the three confirmation checks and the Phase 4 validation, and we'll move to Phase 5 (concurrent mount soak) once green.
