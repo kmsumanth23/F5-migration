@@ -453,3 +453,8 @@ kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o yaml
 ```
 
 Once we see the output we'll know exactly which fix to apply. Most likely it's the class-annotation issue and adding `kubernetes.io/ingress.class: nginx-f5-poc` as an annotation will fix it — but let's confirm before guessing.
+
+curl -sk -I \
+  -H "Host: vs-test.poc-test.hxun.local" \
+  -H "Origin: https://poc-test.hxun.local" \
+  http://localhost:8080/
