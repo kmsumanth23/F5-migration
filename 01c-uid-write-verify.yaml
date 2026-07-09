@@ -297,164 +297,185 @@ Share the output of the three confirmation checks and the Phase 4 validation, an
     - f5-nginx-migrate
 
 
-Good progress — the migration ran cleanly, the Ingress was generated, and F5 reached it. The 404 is telling us something specific though, let me diagnose.
+Excellent — Phase 4 fully validated, both anomalies explained. Onto Phase 5.
 
 ---
 
-## What the 404 Actually Means
+## Phase 5 — Concurrent Mount Soak Test
 
-You don't need `/etc/hosts` — port-forward with `-H "Host:"` bypasses DNS entirely. The Host header IS the routing signal.
+**Goal:** Prove that fake-old-nginx (simulating community NGINX) and F5 (new controller) can both mount the same EFS access point via their separate PVCs, both read the same files at the same time, and neither disrupts the other for a sustained period.
 
-The 404 is from **F5 nginx itself** (see `Server: nginx/1.29.8`), not from the backend. That means F5 received the request but did not match it to any Ingress rule. There are only a few possible causes.
-
-Let me walk through them in likelihood order.
+This is the critical safety proof for Freedom's real cutover window — the ~15-30 minutes when both controllers are running side-by-side before you delete the old one.
 
 ---
 
-## Most Likely Cause — F5 Isn't Watching Ingresses Without Its Own Class
+### Setup — Two Continuous Hash Watchers
 
-Look at the F5 controller args. When F5 is deployed with `ingressClassResource.name: nginx-f5-poc`, by default it only reconciles Ingresses where `spec.ingressClassName: nginx-f5-poc` AND that IngressClass has `controller: nginx.org/ingress-controller`.
+Save this as `05-continuous-monitor.yaml`:
 
-Your generated Ingress does have `ingressClassName: nginx-f5-poc` ✅ and from your earlier output:
-```
-nginx-f5-poc  nginx.org/ingress-controller  <none>  3h10m  ✅
-```
-
-That should be fine. But there's a subtlety — F5 by default only watches Ingresses whose `IngressClass.spec.controller` matches its own `controllerName` config. And even more subtle: F5 has a runtime arg `-use-ingress-class-only=true` in some Helm chart versions that further restricts.
-
-Let me first check whether F5 sees the Ingress at all.
-
----
-
-## Diagnostic Steps — Run These in Order
-
-### Check 1 — Is F5 aware of the Ingress?
-
-```bash
-kubectl -n poc-f5-new logs -l app.kubernetes.io/instance=f5-nginx-poc --tail=200 | grep -iE "poc-test-source-f5-test|AddedOrUpdated|Rejected"
-```
-
-**Expected:** should see something like `AddedOrUpdated Configuration for poc-f5-new/poc-test-source-f5-test was added or updated`.
-
-If nothing appears → F5 isn't watching this Ingress at all → IngressClass filtering issue.
-
-### Check 2 — What does F5 think is configured?
-
-```bash
-F5_POD=$(kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
-kubectl -n poc-f5-new exec $F5_POD -- cat /etc/nginx/conf.d/poc-f5-new-poc-test-source-f5-test.conf 2>&1 | head -50
-```
-
-**Expected:** a real nginx server block with `server_name vs-test.poc-test.hxun.local` and a location block referring to `test-backend`.
-
-If file doesn't exist → F5 didn't render config for this Ingress → same class filter issue.
-If file exists → F5 has the config but something in the request isn't matching.
-
-### Check 3 — What server blocks does F5 actually know about?
-
-```bash
-kubectl -n poc-f5-new exec $F5_POD -- nginx -T 2>&1 | grep -E "server_name|server {" | head -30
-```
-
-**Expected:** should include `server_name vs-test.poc-test.hxun.local;` somewhere.
-
-If missing → F5 didn't process this Ingress.
-If present → the config is loaded but the request routing failed for some reason.
-
-### Check 4 — F5's controller args (rules out class filter mismatch)
-
-```bash
-kubectl -n poc-f5-new get pod $F5_POD -o yaml | grep -A20 "args:" | head -40
-```
-
-Look for:
-- `-ingress-class=nginx-f5-poc` ← what class it's watching
-- `-use-ingress-class-only` ← if this is `true`, class must match exactly
-
----
-
-## Two Likely Fixes Depending on Diagnostics
-
-### If Check 1 shows F5 never picked up the Ingress:
-
-Most likely the Ingress's class annotation vs spec is being interpreted differently, or the controller's arg is restricting. Try adding the legacy annotation as well:
-
-```bash
-kubectl -n poc-f5-new annotate ingress poc-test-source-f5-test \
-  kubernetes.io/ingress.class=nginx-f5-poc --overwrite
-```
-
-Then re-check Check 1.
-
-### If Check 3 shows the server block IS loaded but curl still 404s:
-
-This is a NodePort routing issue. The port-forward is going to the F5 service on port 443 — but check what backend port that maps to:
-
-```bash
-kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o yaml | grep -A10 "ports:"
-```
-
-You want the port with `name: https` to have `targetPort: 443`. If the service is only exposing NodePort HTTP (port 80) and you're hitting HTTPS 8443, F5 sees an HTTPS request on the HTTP listener → 400 or 404.
-
-**Try port 8080 → 80 (HTTP) instead:**
-```bash
-# Kill existing port-forward first
-kill %1 2>/dev/null
-
-# Port-forward to HTTP instead
-kubectl -n poc-f5-new port-forward $F5_POC_SVC 8080:80 &
-
-# Curl over HTTP
-curl -sk -I -H "Host: vs-test.poc-test.hxun.local" http://localhost:8080/
-```
-
-If HTTP works and HTTPS 404s → the Ingress needs a TLS block, or F5's HTTPS listener is defaulting to no match.
-
----
-
-## One More Thing Worth Noticing in the Generated YAML
-
-Your Method 2 migration added a `nginx.org/sticky-cookie-services` annotation:
 ```yaml
-nginx.org/sticky-cookie-services: serviceName=test-backend default_cookie expires=172800s path=/ httponly
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hash-watcher-old
+  namespace: poc-old-nginx
+  labels:
+    purpose: soak-test
+spec:
+  containers:
+  - name: shell
+    image: busybox
+    command: ["sh", "-c"]
+    args:
+    - |
+      while true; do
+        H=$(md5sum /mnt/config/fmc/fhmc.conf 2>&1 | awk '{print $1}')
+        SIZE=$(stat -c '%s' /mnt/config/fmc/fhmc.conf 2>&1)
+        echo "$(date -Iseconds) OLD-SIDE hash=$H size=$SIZE"
+        sleep 5
+      done
+    volumeMounts:
+    - name: config
+      mountPath: /mnt/config
+      readOnly: true
+  volumes:
+  - name: config
+    persistentVolumeClaim:
+      claimName: poc-old-config-pvc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hash-watcher-f5
+  namespace: poc-f5-new
+  labels:
+    purpose: soak-test
+spec:
+  containers:
+  - name: shell
+    image: busybox
+    command: ["sh", "-c"]
+    args:
+    - |
+      while true; do
+        H=$(md5sum /mnt/config/fmc/fhmc.conf 2>&1 | awk '{print $1}')
+        SIZE=$(stat -c '%s' /mnt/config/fmc/fhmc.conf 2>&1)
+        echo "$(date -Iseconds) F5-SIDE hash=$H size=$SIZE"
+        sleep 5
+      done
+    volumeMounts:
+    - name: config
+      mountPath: /mnt/config
+      readOnly: true
+  volumes:
+  - name: config
+    persistentVolumeClaim:
+      claimName: poc-f5-config-pvc
 ```
 
-That references `test-backend` as the service. That's correct — matches your spec.rules backend. Good.
+Apply and wait for both pods:
 
-The generated config also has HSTS, CORS via server-snippets, location-snippets with the include. All look reasonable.
+```bash
+kubectl apply -f 05-continuous-monitor.yaml
+kubectl -n poc-old-nginx wait --for=condition=Ready pod/hash-watcher-old --timeout=60s
+kubectl -n poc-f5-new  wait --for=condition=Ready pod/hash-watcher-f5  --timeout=60s
+```
 
 ---
 
-## What to Do Right Now
+### Start the Soak
 
-Run these four diagnostic checks in order and share the output. That will pinpoint the cause exactly.
+Run this in a `screen` or `tmux` session so it survives your terminal — this needs to run for at least 30 minutes.
 
+**Terminal 1 — old-side watcher:**
 ```bash
-F5_POD=$(kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
-
-# 1. Does F5 log show it picked up the Ingress?
-echo "=== Check 1: F5 log for our ingress ==="
-kubectl -n poc-f5-new logs -l app.kubernetes.io/instance=f5-nginx-poc --tail=300 | grep -iE "poc-test-source-f5-test|AddedOrUpdated|Rejected|Warning"
-
-# 2. Is the nginx config file generated?
-echo ""
-echo "=== Check 2: nginx conf.d listing ==="
-kubectl -n poc-f5-new exec $F5_POD -- ls -la /etc/nginx/conf.d/ 2>&1
-
-# 3. Does nginx -T show our server_name?
-echo ""
-echo "=== Check 3: server_name in loaded config ==="
-kubectl -n poc-f5-new exec $F5_POD -- nginx -T 2>&1 | grep -E "server_name" | head -20
-
-# 4. F5 controller args and svc ports
-echo ""
-echo "=== Check 4: F5 svc port mapping ==="
-kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o yaml | grep -A2 "  - name:"
+kubectl -n poc-old-nginx logs -f hash-watcher-old
 ```
 
-Once we see the output we'll know exactly which fix to apply. Most likely it's the class-annotation issue and adding `kubernetes.io/ingress.class: nginx-f5-poc` as an annotation will fix it — but let's confirm before guessing.
+**Terminal 2 — F5-side watcher:**
+```bash
+kubectl -n poc-f5-new logs -f hash-watcher-f5
+```
 
-curl -sk -I \
-  -H "Host: vs-test.poc-test.hxun.local" \
-  -H "Origin: https://poc-test.hxun.local" \
-  http://localhost:8080/
+**Terminal 3 — continuous curl through F5 (assuming port-forward 8080→80 is still up):**
+```bash
+# If port-forward isn't running, restart it
+# F5_POC_SVC=$(kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+# kubectl -n poc-f5-new port-forward $F5_POC_SVC 8080:80 &
+
+# Continuous curl with logging
+while true; do
+  T=$(date -Iseconds)
+  R=$(curl -sk -o /dev/null -w "status=%{http_code} time=%{time_total}s" \
+    -H "Host: vs-test.poc-test.hxun.local" \
+    http://localhost:8080/ 2>&1)
+  MARKER=$(curl -sk -I -H "Host: vs-test.poc-test.hxun.local" \
+    http://localhost:8080/ 2>&1 | grep -i x-poc-marker | tr -d '\r' || echo "MISSING")
+  echo "$T $R | $MARKER"
+  sleep 10
+done | tee /tmp/f5-soak-test.log
+```
+
+**Terminal 4 — F5 controller log tail:**
+```bash
+kubectl -n poc-f5-new logs -f -l app.kubernetes.io/instance=f5-nginx-poc | grep -iE "error|warn|reload|removed|mount"
+```
+
+**Let it run 30+ minutes.** Longer is better — 60 min if you have time.
+
+---
+
+### Success Gates for Phase 5
+
+At the end of the soak, all of these must hold:
+
+1. **Hash consistency across time and both watchers** — every line in both watcher logs should show `27c61417ae9f8eea8476bf3b5665c101` (or whatever your reference hash was after removing the uid101-write-test.txt cleanup). Grep for anything else:
+   ```bash
+   grep -v "27c61417ae9f8eea8476bf3b5665c101" /tmp/soak-old.log /tmp/soak-f5.log 2>/dev/null || echo "No hash drift"
+   ```
+
+2. **Zero non-200 responses from curl:**
+   ```bash
+   grep -v "status=200" /tmp/f5-soak-test.log | grep status= || echo "All 200s"
+   ```
+
+3. **X-POC-Marker present every check:**
+   ```bash
+   grep -c "hxun-static-pv-poc-v1" /tmp/f5-soak-test.log
+   # Should equal the number of curl iterations (roughly duration_seconds / 10)
+   ```
+
+4. **No CSI/mount errors on any watcher or F5 pod:**
+   ```bash
+   kubectl -n poc-old-nginx describe pod hash-watcher-old | grep -A5 Events
+   kubectl -n poc-f5-new  describe pod hash-watcher-f5  | grep -A5 Events
+   kubectl -n poc-f5-new  describe pod -l app.kubernetes.io/instance=f5-nginx-poc | grep -A5 Events
+   ```
+
+5. **F5 controller pod didn't restart during the soak:**
+   ```bash
+   kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc
+   # RESTARTS column should be 0 (or unchanged from before the soak)
+   ```
+
+---
+
+### What This Proves
+
+If all 5 gates pass:
+
+- Two separate PVCs in two separate namespaces backed by the same EFS access point can coexist under sustained load
+- Neither side loses its mount or sees intermittent errors
+- F5 continues serving traffic reliably with the include from EFS working
+- No file locking, corruption, or visibility issues between the two mount points
+- The Freedom cutover window (however long it takes to route traffic away) is safe from a storage layer perspective
+
+This is the strongest evidence we can gather short of running against actual Freedom prod.
+
+---
+
+### What to Do While It Runs
+
+Since this is a soak test, you don't need to actively watch it. Set it up in `screen`/`tmux`, come back in 30-60 minutes, and check the logs. If everything's clean, we move to Phase 6 (simulated cutover — delete the fake-old-nginx and confirm F5 keeps working).
+
+Share the summary output from the success gates when done. If anything's not clean, we investigate before proceeding.
