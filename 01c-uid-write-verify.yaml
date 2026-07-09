@@ -59,3 +59,14 @@ kubectl -n poc-f5-new delete pod uid-write-verify
 
 # Clean up test file (from either side works — both write to same EFS)
 kubectl -n poc-old-nginx exec deploy/fake-old-nginx -- rm /etc/nginx/custom/fmc/uid101-write-test.txt
+
+test before phase 4
+# 1. F5 pod actually mounted the PVC at the right path
+F5_POD=$(kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+kubectl -n poc-f5-new exec $F5_POD -- ls -la /etc/nginx/custom/fmc/
+
+# 2. F5 hash of the file matches reference (27c61417ae9f8eea8476bf3b5665c101)
+kubectl -n poc-f5-new exec $F5_POD -- md5sum /etc/nginx/custom/fmc/fhmc.conf
+
+# 3. No CSI mount errors in pod events
+kubectl -n poc-f5-new describe pod $F5_POD | grep -A5 Events
