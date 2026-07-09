@@ -264,3 +264,34 @@ That's the exact Freedom scenario proven top to bottom.
 ---
 
 Share the output of the three confirmation checks and the Phase 4 validation, and we'll move to Phase 5 (concurrent mount soak) once green.
+
+# ══════════════════════════════════════════════════════════════════════════
+# POC — MIGRATION_ITEM HARDCODED IN PLAYBOOK
+# ══════════════════════════════════════════════════════════════════════════
+# Values hardcoded here so this POC can run without editing tools.yaml.
+# For production, remove this block and pass migration_item via extra-vars
+# or tools.yaml as normal.
+#
+# POC scenario: convert poc-test-source Ingress in poc-f5-new namespace
+# so F5 loads the include /etc/nginx/custom/fmc/fhmc.conf from the shared
+# EFS access point, proving the runtime read path end-to-end.
+# ══════════════════════════════════════════════════════════════════════════
+- name: "[POC] Hardcode migration_item for this run"
+  ansible.builtin.set_fact:
+    migration_item:
+      namespace:              "poc-f5-new"
+      ingress_name:           "poc-test-source"
+      old_ingress_class:      "nginx-poc-source"
+      new_ingress_class:      "nginx-f5-poc"
+      f5_namespace:           "poc-f5-new"
+      f5_release_name:        "f5-nginx-poc"
+      backup_path:            "/apps/hxun/prod/utils/f5-poc-migration"
+      test_mode:              true
+      test_host:              "vs-test.poc-test.hxun.local"
+      atomic_switch:          false
+      dry_run:                false
+      session_affinity_mode:  "global"
+      multi:                  false
+      env:                    "np"
+  tags:
+    - f5-nginx-migrate
