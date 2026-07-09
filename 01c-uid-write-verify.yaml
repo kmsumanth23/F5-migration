@@ -295,3 +295,161 @@ Share the output of the three confirmation checks and the Phase 4 validation, an
       env:                    "np"
   tags:
     - f5-nginx-migrate
+
+
+Good progress — the migration ran cleanly, the Ingress was generated, and F5 reached it. The 404 is telling us something specific though, let me diagnose.
+
+---
+
+## What the 404 Actually Means
+
+You don't need `/etc/hosts` — port-forward with `-H "Host:"` bypasses DNS entirely. The Host header IS the routing signal.
+
+The 404 is from **F5 nginx itself** (see `Server: nginx/1.29.8`), not from the backend. That means F5 received the request but did not match it to any Ingress rule. There are only a few possible causes.
+
+Let me walk through them in likelihood order.
+
+---
+
+## Most Likely Cause — F5 Isn't Watching Ingresses Without Its Own Class
+
+Look at the F5 controller args. When F5 is deployed with `ingressClassResource.name: nginx-f5-poc`, by default it only reconciles Ingresses where `spec.ingressClassName: nginx-f5-poc` AND that IngressClass has `controller: nginx.org/ingress-controller`.
+
+Your generated Ingress does have `ingressClassName: nginx-f5-poc` ✅ and from your earlier output:
+```
+nginx-f5-poc  nginx.org/ingress-controller  <none>  3h10m  ✅
+```
+
+That should be fine. But there's a subtlety — F5 by default only watches Ingresses whose `IngressClass.spec.controller` matches its own `controllerName` config. And even more subtle: F5 has a runtime arg `-use-ingress-class-only=true` in some Helm chart versions that further restricts.
+
+Let me first check whether F5 sees the Ingress at all.
+
+---
+
+## Diagnostic Steps — Run These in Order
+
+### Check 1 — Is F5 aware of the Ingress?
+
+```bash
+kubectl -n poc-f5-new logs -l app.kubernetes.io/instance=f5-nginx-poc --tail=200 | grep -iE "poc-test-source-f5-test|AddedOrUpdated|Rejected"
+```
+
+**Expected:** should see something like `AddedOrUpdated Configuration for poc-f5-new/poc-test-source-f5-test was added or updated`.
+
+If nothing appears → F5 isn't watching this Ingress at all → IngressClass filtering issue.
+
+### Check 2 — What does F5 think is configured?
+
+```bash
+F5_POD=$(kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+kubectl -n poc-f5-new exec $F5_POD -- cat /etc/nginx/conf.d/poc-f5-new-poc-test-source-f5-test.conf 2>&1 | head -50
+```
+
+**Expected:** a real nginx server block with `server_name vs-test.poc-test.hxun.local` and a location block referring to `test-backend`.
+
+If file doesn't exist → F5 didn't render config for this Ingress → same class filter issue.
+If file exists → F5 has the config but something in the request isn't matching.
+
+### Check 3 — What server blocks does F5 actually know about?
+
+```bash
+kubectl -n poc-f5-new exec $F5_POD -- nginx -T 2>&1 | grep -E "server_name|server {" | head -30
+```
+
+**Expected:** should include `server_name vs-test.poc-test.hxun.local;` somewhere.
+
+If missing → F5 didn't process this Ingress.
+If present → the config is loaded but the request routing failed for some reason.
+
+### Check 4 — F5's controller args (rules out class filter mismatch)
+
+```bash
+kubectl -n poc-f5-new get pod $F5_POD -o yaml | grep -A20 "args:" | head -40
+```
+
+Look for:
+- `-ingress-class=nginx-f5-poc` ← what class it's watching
+- `-use-ingress-class-only` ← if this is `true`, class must match exactly
+
+---
+
+## Two Likely Fixes Depending on Diagnostics
+
+### If Check 1 shows F5 never picked up the Ingress:
+
+Most likely the Ingress's class annotation vs spec is being interpreted differently, or the controller's arg is restricting. Try adding the legacy annotation as well:
+
+```bash
+kubectl -n poc-f5-new annotate ingress poc-test-source-f5-test \
+  kubernetes.io/ingress.class=nginx-f5-poc --overwrite
+```
+
+Then re-check Check 1.
+
+### If Check 3 shows the server block IS loaded but curl still 404s:
+
+This is a NodePort routing issue. The port-forward is going to the F5 service on port 443 — but check what backend port that maps to:
+
+```bash
+kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o yaml | grep -A10 "ports:"
+```
+
+You want the port with `name: https` to have `targetPort: 443`. If the service is only exposing NodePort HTTP (port 80) and you're hitting HTTPS 8443, F5 sees an HTTPS request on the HTTP listener → 400 or 404.
+
+**Try port 8080 → 80 (HTTP) instead:**
+```bash
+# Kill existing port-forward first
+kill %1 2>/dev/null
+
+# Port-forward to HTTP instead
+kubectl -n poc-f5-new port-forward $F5_POC_SVC 8080:80 &
+
+# Curl over HTTP
+curl -sk -I -H "Host: vs-test.poc-test.hxun.local" http://localhost:8080/
+```
+
+If HTTP works and HTTPS 404s → the Ingress needs a TLS block, or F5's HTTPS listener is defaulting to no match.
+
+---
+
+## One More Thing Worth Noticing in the Generated YAML
+
+Your Method 2 migration added a `nginx.org/sticky-cookie-services` annotation:
+```yaml
+nginx.org/sticky-cookie-services: serviceName=test-backend default_cookie expires=172800s path=/ httponly
+```
+
+That references `test-backend` as the service. That's correct — matches your spec.rules backend. Good.
+
+The generated config also has HSTS, CORS via server-snippets, location-snippets with the include. All look reasonable.
+
+---
+
+## What to Do Right Now
+
+Run these four diagnostic checks in order and share the output. That will pinpoint the cause exactly.
+
+```bash
+F5_POD=$(kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+
+# 1. Does F5 log show it picked up the Ingress?
+echo "=== Check 1: F5 log for our ingress ==="
+kubectl -n poc-f5-new logs -l app.kubernetes.io/instance=f5-nginx-poc --tail=300 | grep -iE "poc-test-source-f5-test|AddedOrUpdated|Rejected|Warning"
+
+# 2. Is the nginx config file generated?
+echo ""
+echo "=== Check 2: nginx conf.d listing ==="
+kubectl -n poc-f5-new exec $F5_POD -- ls -la /etc/nginx/conf.d/ 2>&1
+
+# 3. Does nginx -T show our server_name?
+echo ""
+echo "=== Check 3: server_name in loaded config ==="
+kubectl -n poc-f5-new exec $F5_POD -- nginx -T 2>&1 | grep -E "server_name" | head -20
+
+# 4. F5 controller args and svc ports
+echo ""
+echo "=== Check 4: F5 svc port mapping ==="
+kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o yaml | grep -A2 "  - name:"
+```
+
+Once we see the output we'll know exactly which fix to apply. Most likely it's the class-annotation issue and adding `kubernetes.io/ingress.class: nginx-f5-poc` as an annotation will fix it — but let's confirm before guessing.
