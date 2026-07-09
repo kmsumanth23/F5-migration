@@ -3,12 +3,12 @@
 # ── 0. Variable Defaults ──────────────────────────────────────────────────────
 - name: Set F5 NGINX default variables
   ansible.builtin.set_fact:
-    _f5_namespace:         "{{ f5_nginx_item.namespace }}"
-    _f5_release_name:      "{{ f5_nginx_item.release_name }}"
-    _f5_ingress_class:     "{{ f5_nginx_item.ingress_class }}"
-    _f5_image_version:     "{{ f5_nginx_item.image_version }}"
-    _f5_chart_version:     "{{ f5_nginx_item.chart_version }}"
-    _f5_path:              "{{ f5_nginx_item.path }}"
+    _f5_namespace:         "poc-f5-new"
+    _f5_release_name:      "f5-nginx-poc"
+    _f5_ingress_class:     "nginx-f5-poc"
+    _f5_image_version:     "5.4.2-ubi"
+    _f5_chart_version:     "2.5.2"
+    _f5_path:              "/apps/hxun/prod/utils/f5-poc"
 
     # ══════════════════════════════════════════════════════════════════════════
     # POC — PVC + Static PV HARDCODED IN PLAYBOOK
