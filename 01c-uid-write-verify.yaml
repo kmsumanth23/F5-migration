@@ -297,113 +297,49 @@ Share the output of the three confirmation checks and the Phase 4 validation, an
     - f5-nginx-migrate
 
 
-Excellent — Phase 4 fully validated, both anomalies explained. Onto Phase 5.
+Phase 5 ✅ — clean pass on every gate.
 
 ---
 
-## Phase 5 — Concurrent Mount Soak Test
+## Phase 5 Results
 
-**Goal:** Prove that fake-old-nginx (simulating community NGINX) and F5 (new controller) can both mount the same EFS access point via their separate PVCs, both read the same files at the same time, and neither disrupts the other for a sustained period.
+```
+✅ Hash drift          : none (both sides identical for 49 min)
+✅ Non-200 responses   : none (curl 100% success)
+✅ X-POC-Marker count  : 261 (every single response carried the marker)
+✅ CSI/mount errors    : none on any pod
+✅ F5 pod restarts     : 0 (7h41m uptime, no interruption)
+```
 
-This is the critical safety proof for Freedom's real cutover window — the ~15-30 minutes when both controllers are running side-by-side before you delete the old one.
+261 markers × 10s interval = ~44 minutes of continuous verified traffic. That's well past the 30-min minimum and firmly proves the concurrent-mount pattern is stable.
 
 ---
 
-### Setup — Two Continuous Hash Watchers
+## What Phase 5 Proved
 
-Save this as `05-continuous-monitor.yaml`:
+- Two PVCs in different namespaces backed by the same EFS access point can run concurrently under sustained read load
+- Neither controller lost its mount, saw stale data, or hit lock contention
+- F5's pod didn't restart or reload disruptively during the soak
+- The cutover window for Freedom (however long it takes to shift ALB target group) is safe from a storage-layer perspective
 
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: hash-watcher-old
-  namespace: poc-old-nginx
-  labels:
-    purpose: soak-test
-spec:
-  containers:
-  - name: shell
-    image: busybox
-    command: ["sh", "-c"]
-    args:
-    - |
-      while true; do
-        H=$(md5sum /mnt/config/fmc/fhmc.conf 2>&1 | awk '{print $1}')
-        SIZE=$(stat -c '%s' /mnt/config/fmc/fhmc.conf 2>&1)
-        echo "$(date -Iseconds) OLD-SIDE hash=$H size=$SIZE"
-        sleep 5
-      done
-    volumeMounts:
-    - name: config
-      mountPath: /mnt/config
-      readOnly: true
-  volumes:
-  - name: config
-    persistentVolumeClaim:
-      claimName: poc-old-config-pvc
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: hash-watcher-f5
-  namespace: poc-f5-new
-  labels:
-    purpose: soak-test
-spec:
-  containers:
-  - name: shell
-    image: busybox
-    command: ["sh", "-c"]
-    args:
-    - |
-      while true; do
-        H=$(md5sum /mnt/config/fmc/fhmc.conf 2>&1 | awk '{print $1}')
-        SIZE=$(stat -c '%s' /mnt/config/fmc/fhmc.conf 2>&1)
-        echo "$(date -Iseconds) F5-SIDE hash=$H size=$SIZE"
-        sleep 5
-      done
-    volumeMounts:
-    - name: config
-      mountPath: /mnt/config
-      readOnly: true
-  volumes:
-  - name: config
-    persistentVolumeClaim:
-      claimName: poc-f5-config-pvc
-```
-
-Apply and wait for both pods:
-
-```bash
-kubectl apply -f 05-continuous-monitor.yaml
-kubectl -n poc-old-nginx wait --for=condition=Ready pod/hash-watcher-old --timeout=60s
-kubectl -n poc-f5-new  wait --for=condition=Ready pod/hash-watcher-f5  --timeout=60s
-```
+Combined with Phases 0-4, we've now proven the complete end-to-end path that Freedom will follow in production.
 
 ---
 
-### Start the Soak
+## Phase 6 — Simulated Cutover (15 min)
 
-Run this in a `screen` or `tmux` session so it survives your terminal — this needs to run for at least 30 minutes.
+Simple test — delete `fake-old-nginx` (simulating old community NGINX being decommissioned) and confirm F5 keeps working unaffected.
 
-**Terminal 1 — old-side watcher:**
+### Setup
+
+**When you're back on the bastion, restart the port-forward and the curl loop first:**
+
 ```bash
-kubectl -n poc-old-nginx logs -f hash-watcher-old
-```
+# Port-forward
+F5_POC_SVC=$(kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
+kubectl -n poc-f5-new port-forward $F5_POC_SVC 8080:80 &
 
-**Terminal 2 — F5-side watcher:**
-```bash
-kubectl -n poc-f5-new logs -f hash-watcher-f5
-```
-
-**Terminal 3 — continuous curl through F5 (assuming port-forward 8080→80 is still up):**
-```bash
-# If port-forward isn't running, restart it
-# F5_POC_SVC=$(kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
-# kubectl -n poc-f5-new port-forward $F5_POC_SVC 8080:80 &
-
-# Continuous curl with logging
+# Continuous curl (same as Phase 5)
 while true; do
   T=$(date -Iseconds)
   R=$(curl -sk -o /dev/null -w "status=%{http_code} time=%{time_total}s" \
@@ -412,70 +348,60 @@ while true; do
   MARKER=$(curl -sk -I -H "Host: vs-test.poc-test.hxun.local" \
     http://localhost:8080/ 2>&1 | grep -i x-poc-marker | tr -d '\r' || echo "MISSING")
   echo "$T $R | $MARKER"
-  sleep 10
-done | tee /tmp/f5-soak-test.log
+  sleep 5
+done | tee /tmp/phase6-cutover.log
 ```
 
-**Terminal 4 — F5 controller log tail:**
+Confirm you're seeing 200s + marker before proceeding.
+
+### Cutover Action
+
+**In another terminal — record the moment, then delete fake-old-nginx:**
+
 ```bash
-kubectl -n poc-f5-new logs -f -l app.kubernetes.io/instance=f5-nginx-poc | grep -iE "error|warn|reload|removed|mount"
+echo "===== CUTOVER TRIGGERED at $(date -Iseconds) =====" | tee -a /tmp/phase6-cutover.log
+kubectl -n poc-old-nginx delete deployment fake-old-nginx
 ```
 
-**Let it run 30+ minutes.** Longer is better — 60 min if you have time.
+Also delete `hash-watcher-old` since its PVC is still in the old namespace — we're not testing that side anymore:
 
----
+```bash
+kubectl -n poc-old-nginx delete pod hash-watcher-old
+```
 
-### Success Gates for Phase 5
+### Watch for 10-15 minutes
 
-At the end of the soak, all of these must hold:
+Let the curl loop run. Watch for:
+- Any status code that's not 200
+- Any missing X-POC-Marker
+- F5 pod restarts
+- CSI errors
 
-1. **Hash consistency across time and both watchers** — every line in both watcher logs should show `27c61417ae9f8eea8476bf3b5665c101` (or whatever your reference hash was after removing the uid101-write-test.txt cleanup). Grep for anything else:
-   ```bash
-   grep -v "27c61417ae9f8eea8476bf3b5665c101" /tmp/soak-old.log /tmp/soak-f5.log 2>/dev/null || echo "No hash drift"
-   ```
+### Success Gates
 
-2. **Zero non-200 responses from curl:**
-   ```bash
-   grep -v "status=200" /tmp/f5-soak-test.log | grep status= || echo "All 200s"
-   ```
+After 10-15 minutes:
 
-3. **X-POC-Marker present every check:**
-   ```bash
-   grep -c "hxun-static-pv-poc-v1" /tmp/f5-soak-test.log
-   # Should equal the number of curl iterations (roughly duration_seconds / 10)
-   ```
+```bash
+# 1. Any non-200s during or after cutover?
+grep -v "status=200" /tmp/phase6-cutover.log | grep status= || echo "All 200s through cutover"
 
-4. **No CSI/mount errors on any watcher or F5 pod:**
-   ```bash
-   kubectl -n poc-old-nginx describe pod hash-watcher-old | grep -A5 Events
-   kubectl -n poc-f5-new  describe pod hash-watcher-f5  | grep -A5 Events
-   kubectl -n poc-f5-new  describe pod -l app.kubernetes.io/instance=f5-nginx-poc | grep -A5 Events
-   ```
+# 2. Marker present every check?
+grep -c "hxun-static-pv-poc-v1" /tmp/phase6-cutover.log
 
-5. **F5 controller pod didn't restart during the soak:**
-   ```bash
-   kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc
-   # RESTARTS column should be 0 (or unchanged from before the soak)
-   ```
+# 3. F5 pod still healthy, no restarts?
+kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc
 
----
+# 4. hash-watcher-f5 still showing same hash?
+kubectl -n poc-f5-new logs hash-watcher-f5 --tail=20
+
+# 5. Confirm old namespace is empty of consumers
+kubectl -n poc-old-nginx get pod
+```
 
 ### What This Proves
 
-If all 5 gates pass:
-
-- Two separate PVCs in two separate namespaces backed by the same EFS access point can coexist under sustained load
-- Neither side loses its mount or sees intermittent errors
-- F5 continues serving traffic reliably with the include from EFS working
-- No file locking, corruption, or visibility issues between the two mount points
-- The Freedom cutover window (however long it takes to route traffic away) is safe from a storage layer perspective
-
-This is the strongest evidence we can gather short of running against actual Freedom prod.
+If F5 keeps working after fake-old-nginx is deleted, we've proven that decommissioning the old controller doesn't disrupt F5's mount or its ability to read `fhmc.conf`. That's the last piece of the Freedom cutover story.
 
 ---
 
-### What to Do While It Runs
-
-Since this is a soak test, you don't need to actively watch it. Set it up in `screen`/`tmux`, come back in 30-60 minutes, and check the logs. If everything's clean, we move to Phase 6 (simulated cutover — delete the fake-old-nginx and confirm F5 keeps working).
-
-Share the summary output from the success gates when done. If anything's not clean, we investigate before proceeding.
+Whenever you're ready to run it — no rush. When it's done, share the gate outputs and we'll wrap with Phase 7 (rollback simulation) and cleanup.
