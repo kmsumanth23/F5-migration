@@ -326,82 +326,65 @@ Combined with Phases 0-4, we've now proven the complete end-to-end path that Fre
 
 ---
 
-## Phase 6 — Simulated Cutover (15 min)
-
-Simple test — delete `fake-old-nginx` (simulating old community NGINX being decommissioned) and confirm F5 keeps working unaffected.
-
-### Setup
-
-**When you're back on the bastion, restart the port-forward and the curl loop first:**
-
-```bash
-# Port-forward
-F5_POC_SVC=$(kubectl -n poc-f5-new get svc -l app.kubernetes.io/instance=f5-nginx-poc -o name | head -1)
-kubectl -n poc-f5-new port-forward $F5_POC_SVC 8080:80 &
-
-# Continuous curl (same as Phase 5)
-while true; do
-  T=$(date -Iseconds)
-  R=$(curl -sk -o /dev/null -w "status=%{http_code} time=%{time_total}s" \
-    -H "Host: vs-test.poc-test.hxun.local" \
-    http://localhost:8080/ 2>&1)
-  MARKER=$(curl -sk -I -H "Host: vs-test.poc-test.hxun.local" \
-    http://localhost:8080/ 2>&1 | grep -i x-poc-marker | tr -d '\r' || echo "MISSING")
-  echo "$T $R | $MARKER"
-  sleep 5
-done | tee /tmp/phase6-cutover.log
-```
-
-Confirm you're seeing 200s + marker before proceeding.
-
-### Cutover Action
-
-**In another terminal — record the moment, then delete fake-old-nginx:**
-
-```bash
-echo "===== CUTOVER TRIGGERED at $(date -Iseconds) =====" | tee -a /tmp/phase6-cutover.log
-kubectl -n poc-old-nginx delete deployment fake-old-nginx
-```
-
-Also delete `hash-watcher-old` since its PVC is still in the old namespace — we're not testing that side anymore:
-
-```bash
-kubectl -n poc-old-nginx delete pod hash-watcher-old
-```
-
-### Watch for 10-15 minutes
-
-Let the curl loop run. Watch for:
-- Any status code that's not 200
-- Any missing X-POC-Marker
-- F5 pod restarts
-- CSI errors
-
-### Success Gates
-
-After 10-15 minutes:
-
-```bash
-# 1. Any non-200s during or after cutover?
-grep -v "status=200" /tmp/phase6-cutover.log | grep status= || echo "All 200s through cutover"
-
-# 2. Marker present every check?
-grep -c "hxun-static-pv-poc-v1" /tmp/phase6-cutover.log
-
-# 3. F5 pod still healthy, no restarts?
-kubectl -n poc-f5-new get pod -l app.kubernetes.io/instance=f5-nginx-poc
-
-# 4. hash-watcher-f5 still showing same hash?
-kubectl -n poc-f5-new logs hash-watcher-f5 --tail=20
-
-# 5. Confirm old namespace is empty of consumers
-kubectl -n poc-old-nginx get pod
-```
-
-### What This Proves
-
-If F5 keeps working after fake-old-nginx is deleted, we've proven that decommissioning the old controller doesn't disrupt F5's mount or its ability to read `fhmc.conf`. That's the last piece of the Freedom cutover story.
+Phase 6 ✅ — clean pass, F5 unaffected by old controller decommission.
 
 ---
 
+## Phase 6 Results
+
+```
+✅ All 200s through cutover        (zero failures during or after delete)
+✅ X-POC-Marker           : 34    (marker present every check post-cutover)
+✅ F5 pod uptime          : 19h    (0 restarts, no interruption from cutover)
+✅ F5-side hash           : unchanged, still 27c61417...
+✅ Old namespace          : empty (fake-old-nginx cleanly gone)
+✅ Post-cutover curl      : 200 + all POC markers + CORS headers present
+```
+
+The curl at 05:17:38 (~3 minutes after cutover) still returns X-POC-Written-By: fake-old-nginx — F5 is reading the file that was written by a pod that no longer exists. Exactly the behaviour we wanted to prove. The storage is completely decoupled from the writer's lifecycle.
+
+---
+
+## Phase 7 — Rollback Simulation (10 min)
+
+Final phase. Prove that if Freedom needs to roll back to the old controller, the data survives and the old side can come back cleanly.
+
+**Re-apply the old-nginx deployment** (uses the same file you saved as `01a-old-nginx-side.yaml`):
+
+```bash
+kubectl apply -f 01a-old-nginx-side.yaml
+kubectl -n poc-old-nginx wait --for=condition=Ready pod -l app=fake-old-nginx --timeout=120s
+```
+
+**Verify old side comes back and sees the same data:**
+
+```bash
+# Check the seed script skipped seeding (files already exist)
+kubectl -n poc-old-nginx logs -l app=fake-old-nginx --tail=20
+# Should see "=== Files already exist — skipping seed ==="
+
+# Verify hash still matches the reference
+kubectl -n poc-old-nginx exec deploy/fake-old-nginx -- md5sum /etc/nginx/custom/fmc/fhmc.conf
+# Should be: 27c61417ae9f8eea8476bf3b5665c101
+
+# Verify F5 is still fine simultaneously
+kubectl -n poc-f5-new logs hash-watcher-f5 --tail=5
+
+# One more curl to prove everything still works with both sides mounted again
+curl -sk -I -H "Host: vs-test.poc-test.hxun.local" http://localhost:8080/ | head -20
+```
+
+### Success Gates
+
+- Old-nginx pod comes up successfully
+- Seed script logs "Files already exist — skipping seed" (proves data persisted)
+- Hash matches the original reference
+- F5-side hash-watcher still showing the same hash
+- curl still returns 200 with all POC markers
+
+---
+
+If this passes, **the entire POC is complete** and we've proven every safety property Freedom needs. Then we'll do cleanup and I'll write up a final POC summary you can share with the team for Freedom migration sign-off.
+
+Run it whenever you're ready.
 Whenever you're ready to run it — no rush. When it's done, share the gate outputs and we'll wrap with Phase 7 (rollback simulation) and cleanup.
